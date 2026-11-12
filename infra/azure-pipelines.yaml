@@ -1,5 +1,7 @@
 ﻿# Azure DevOps pipeline - Observability Terraform + AKS
 # Manual execution only. Uses Microsoft-hosted Ubuntu.
+# SAFE MODE: Validate + Terraform Plan only; no apply or Kubernetes deployment.
+# This pipeline does not create, update, or delete Azure infrastructure.
 # No Git repository files are committed or pushed by this pipeline.
 # terraform fmt may format the temporary agent checkout only.
 
@@ -157,6 +159,7 @@ stages:
           export ARM_SUBSCRIPTION_ID="$(subscriptionId)"
           export ARM_USE_OIDC=true
           export ARM_OIDC_TOKEN="$idToken"
+          export ARM_SKIP_PROVIDER_REGISTRATION=true
 
           terraform -chdir="$TF_DIR" init -input=false \
             -backend-config="resource_group_name=$(stateResourceGroup)" \
@@ -177,163 +180,3 @@ stages:
       artifact: 'terraform-plan'
       displayName: 'Publish Terraform plan'
 
-- stage: Approval
-  displayName: 'Manual approval before infrastructure changes'
-  dependsOn: Plan
-  condition: succeeded()
-  jobs:
-  - job: WaitForApproval
-    displayName: 'Review Terraform plan'
-    pool: server
-    timeoutInMinutes: 1440
-    steps:
-    - task: ManualValidation@1
-      timeoutInMinutes: 1440
-      inputs:
-        notifyUsers: ''
-        instructions: |
-          Review the Terraform plan produced by the Plan stage.
-          Confirm the Azure subscription, remote state key, and all planned
-          changes. Reject unexpected deletions or replacements.
-          Approve only when the plan is correct.
-        onTimeout: 'reject'
-
-- stage: Apply
-  displayName: 'Terraform apply'
-  dependsOn: Approval
-  condition: succeeded()
-  jobs:
-  - job: ApplyApprovedPlan
-    displayName: 'Apply approved Terraform plan'
-    steps:
-    - checkout: self
-
-    - download: current
-      artifact: 'terraform-plan'
-      displayName: 'Download Terraform plan'
-
-    - bash: |
-        set -euo pipefail
-        sudo apt-get update -y
-        sudo apt-get install -y curl unzip
-        VERSION="$(terraformVersion)"
-        mkdir -p "$(Agent.TempDirectory)/terraform-bin"
-        curl -fsSLo "$(Agent.TempDirectory)/terraform.zip" \
-          "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
-        unzip -o "$(Agent.TempDirectory)/terraform.zip" -d "$(Agent.TempDirectory)/terraform-bin"
-        sudo install -m 0755 "$(Agent.TempDirectory)/terraform-bin/terraform" /usr/local/bin/terraform
-        terraform version
-      displayName: 'Install Terraform $(terraformVersion)'
-
-    - task: AzureCLI@2
-      displayName: 'Terraform init and apply approved plan'
-      inputs:
-        azureSubscription: '$(azureServiceConnection)'
-        scriptType: bash
-        scriptLocation: inlineScript
-        addSpnToEnvironment: true
-        inlineScript: |
-          set -euo pipefail
-          TF_DIR="$(terraformWorkingDirectory)"
-
-          ACTUAL_TENANT="$(az account show --query tenantId --output tsv)"
-          ACTUAL_SUBSCRIPTION="$(az account show --query id --output tsv)"
-          echo "Authenticated tenant: $ACTUAL_TENANT"
-          echo "Authenticated subscription: $ACTUAL_SUBSCRIPTION"
-          if [ "$ACTUAL_TENANT" != "$(tenantId)" ] || [ "$ACTUAL_SUBSCRIPTION" != "$(subscriptionId)" ]; then
-            echo "ERROR: Azure service connection tenant/subscription mismatch. Stopping before apply."
-            exit 1
-          fi
-
-          if [ ! -d "$TF_DIR" ] || [ ! -f "$TF_DIR/main.tf" ]; then
-            echo "ERROR: Terraform root directory is missing: $TF_DIR"
-            exit 1
-          fi
-
-          export ARM_CLIENT_ID="$servicePrincipalId"
-          export ARM_TENANT_ID="$(tenantId)"
-          export ARM_SUBSCRIPTION_ID="$(subscriptionId)"
-          export ARM_USE_OIDC=true
-          export ARM_OIDC_TOKEN="$idToken"
-
-          terraform -chdir="$TF_DIR" init -input=false \
-            -backend-config="resource_group_name=$(stateResourceGroup)" \
-            -backend-config="storage_account_name=$(stateStorageAccount)" \
-            -backend-config="container_name=$(stateContainer)" \
-            -backend-config="key=$(stateKey)" \
-            -backend-config="subscription_id=$(subscriptionId)" \
-            -backend-config="tenant_id=$(tenantId)" \
-            -backend-config="use_azuread_auth=true" \
-            -backend-config="use_oidc=true"
-
-          PLAN_FILE="$(Pipeline.Workspace)/terraform-plan/tfplan"
-          if [ ! -f "$PLAN_FILE" ]; then
-            echo "ERROR: Terraform plan artifact not found: $PLAN_FILE"
-            exit 1
-          fi
-
-          terraform -chdir="$TF_DIR" apply -input=false -auto-approve "$PLAN_FILE"
-
-- stage: DeployKubernetes
-  displayName: 'Deploy Kubernetes manifests'
-  dependsOn: Apply
-  condition: succeeded()
-  jobs:
-  - job: DeployManifests
-    displayName: 'Apply observability manifests to AKS'
-    steps:
-    - checkout: self
-
-    - task: AzureCLI@2
-      displayName: 'Apply Kubernetes YAML files'
-      inputs:
-        azureSubscription: '$(azureServiceConnection)'
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
-          set -euo pipefail
-          ROOT="$(Build.SourcesDirectory)"
-
-          ACTUAL_TENANT="$(az account show --query tenantId --output tsv)"
-          ACTUAL_SUBSCRIPTION="$(az account show --query id --output tsv)"
-          echo "Authenticated tenant: $ACTUAL_TENANT"
-          echo "Authenticated subscription: $ACTUAL_SUBSCRIPTION"
-          if [ "$ACTUAL_TENANT" != "$(tenantId)" ] || [ "$ACTUAL_SUBSCRIPTION" != "$(subscriptionId)" ]; then
-            echo "ERROR: Azure service connection tenant/subscription mismatch. Stopping before AKS deployment."
-            exit 1
-          fi
-
-          # Find one directory containing the three expected manifest files.
-          mapfile -t MANIFEST_DIRS < <(
-            find "$ROOT" -type f -name 'namespace.yaml' \
-              -not -path '*/.git/*' -printf '%h\n' |
-            while IFS= read -r DIR; do
-              if [ -f "$DIR/pvc.yaml" ] && [ -f "$DIR/container-azm-ms-agentconfig.yaml" ]; then
-                printf '%s\n' "$DIR"
-              fi
-            done | sort -u
-          )
-
-          if [ "${#MANIFEST_DIRS[@]}" -ne 1 ]; then
-            echo "ERROR: Expected one folder containing namespace.yaml, pvc.yaml and container-azm-ms-agentconfig.yaml."
-            printf 'Manifest folder candidate: %s\n' "${MANIFEST_DIRS[@]}"
-            exit 1
-          fi
-
-          K8S_DIR="${MANIFEST_DIRS[0]}"
-          echo "Kubernetes manifest directory: $K8S_DIR"
-
-          az aks show \
-            --resource-group "$(aksResourceGroup)" \
-            --name "$(aksCluster)" \
-            --output table
-
-          for MANIFEST in namespace.yaml pvc.yaml container-azm-ms-agentconfig.yaml; do
-            az aks command invoke \
-              --resource-group "$(aksResourceGroup)" \
-              --name "$(aksCluster)" \
-              --command "kubectl apply -f $MANIFEST" \
-              --file "$K8S_DIR/$MANIFEST"
-          done
-
-          echo "Kubernetes manifests applied successfully."
