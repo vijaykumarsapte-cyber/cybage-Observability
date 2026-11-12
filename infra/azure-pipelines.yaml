@@ -109,6 +109,21 @@ stages:
           TF_DIR="$(terraformWorkingDirectory)"
           ROOT="$(Build.SourcesDirectory)"
 
+          ACTUAL_TENANT="$(az account show --query tenantId --output tsv)"
+          ACTUAL_SUBSCRIPTION="$(az account show --query id --output tsv)"
+          echo "Authenticated tenant: $ACTUAL_TENANT"
+          echo "Authenticated subscription: $ACTUAL_SUBSCRIPTION"
+          if [ "$ACTUAL_TENANT" != "$(tenantId)" ]; then
+            echo "ERROR: Service connection tenant does not match the expected tenant."
+            echo "Expected: $(tenantId) | Actual: $ACTUAL_TENANT"
+            exit 1
+          fi
+          if [ "$ACTUAL_SUBSCRIPTION" != "$(subscriptionId)" ]; then
+            echo "ERROR: Service connection subscription does not match the expected subscription."
+            echo "Expected: $(subscriptionId) | Actual: $ACTUAL_SUBSCRIPTION"
+            exit 1
+          fi
+
           if [ ! -d "$TF_DIR" ] || [ ! -f "$TF_DIR/main.tf" ]; then
             echo "ERROR: Confirmed Terraform root is missing: $TF_DIR"
             exit 1
@@ -221,6 +236,15 @@ stages:
           set -euo pipefail
           TF_DIR="$(terraformWorkingDirectory)"
 
+          ACTUAL_TENANT="$(az account show --query tenantId --output tsv)"
+          ACTUAL_SUBSCRIPTION="$(az account show --query id --output tsv)"
+          echo "Authenticated tenant: $ACTUAL_TENANT"
+          echo "Authenticated subscription: $ACTUAL_SUBSCRIPTION"
+          if [ "$ACTUAL_TENANT" != "$(tenantId)" ] || [ "$ACTUAL_SUBSCRIPTION" != "$(subscriptionId)" ]; then
+            echo "ERROR: Azure service connection tenant/subscription mismatch. Stopping before apply."
+            exit 1
+          fi
+
           if [ ! -d "$TF_DIR" ] || [ ! -f "$TF_DIR/main.tf" ]; then
             echo "ERROR: Terraform root directory is missing: $TF_DIR"
             exit 1
@@ -269,6 +293,15 @@ stages:
         inlineScript: |
           set -euo pipefail
           ROOT="$(Build.SourcesDirectory)"
+
+          ACTUAL_TENANT="$(az account show --query tenantId --output tsv)"
+          ACTUAL_SUBSCRIPTION="$(az account show --query id --output tsv)"
+          echo "Authenticated tenant: $ACTUAL_TENANT"
+          echo "Authenticated subscription: $ACTUAL_SUBSCRIPTION"
+          if [ "$ACTUAL_TENANT" != "$(tenantId)" ] || [ "$ACTUAL_SUBSCRIPTION" != "$(subscriptionId)" ]; then
+            echo "ERROR: Azure service connection tenant/subscription mismatch. Stopping before AKS deployment."
+            exit 1
+          fi
 
           # Find one directory containing the three expected manifest files.
           mapfile -t MANIFEST_DIRS < <(
