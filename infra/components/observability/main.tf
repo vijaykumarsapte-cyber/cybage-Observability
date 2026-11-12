@@ -25,6 +25,22 @@ locals {
   ]
 }
 
+# Existing jump-box VNet (rg2_name/vnet2_name), looked up once and only when
+# enable_vm_vnet_connectivity = true. It must exist in this subscription.
+data "azurerm_virtual_network" "jumpbox" {
+  count               = var.enable_vm_vnet_connectivity ? 1 : 0
+  name                = var.vnet2_name
+  resource_group_name = var.rg2_name
+}
+
+locals {
+  # Extra Private DNS zone links: none unless the jump-box VNet is enabled.
+  # Key "vnet2" keeps the link name "<dns_link_name>-vnet2".
+  dns_additional_vnet_links = var.enable_vm_vnet_connectivity ? {
+    vnet2 = data.azurerm_virtual_network.jumpbox[0].id
+  } : {}
+}
+
 # 1. Resource Group
 module "resource_group" {
   source   = "../../modules/resource_group"
@@ -196,6 +212,7 @@ module "acr_dns_zone" {
   private_dns_zone     = "privatelink.azurecr.io"
   dns_link_name        = local.acr_dns_link_name
   vnet_id              = module.vnet.virtual_network_id
+  additional_vnet_links = local.dns_additional_vnet_links
   location             = var.location
 }
 
@@ -220,6 +237,7 @@ module "kv_dns_zone" {
   private_dns_zone     = "privatelink.vaultcore.azure.net"
   dns_link_name        = local.kv_dns_link_name
   vnet_id              = module.vnet.virtual_network_id
+  additional_vnet_links = local.dns_additional_vnet_links
   location             = var.location
 }
 
@@ -247,6 +265,7 @@ module "storage_dns_zone" {
   private_dns_zone     = "privatelink.blob.core.windows.net"
   dns_link_name        = local.blob_dns_link_name
   vnet_id              = module.vnet.virtual_network_id
+  additional_vnet_links = local.dns_additional_vnet_links
   location             = var.location
 }
 
