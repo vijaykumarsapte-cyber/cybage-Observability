@@ -1,4 +1,6 @@
+```yaml
 trigger: none
+pr: none
 
 name: 'IaC-Observability-POC'
 
@@ -9,177 +11,201 @@ variables:
   - group: state-data
 
 stages:
-  - stage: tfvalidate
-    jobs:
-      - job: validate
-        continueOnError: false
-        steps:
 
-          - task: TerraformInstaller@1
-            displayName: Install Terraform
-            inputs:
-              terraformVersion: '1.9.8'
+# =====================================================
+# STAGE 1: TERRAFORM VALIDATION
+# =====================================================
 
-          - task: TerraformTaskV4@4
-            displayName: Terraform Init
-            inputs:
-              provider: 'azurerm'
-              command: 'init'
-              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
-              backendServiceArm: 'ServiceConnection-Sp'
-              backendAzureRmResourceGroupName: 'rg-tfstate-observability'
-              backendAzureRmStorageAccountName: 'stobsstatedev'
-              backendAzureRmContainerName: 'tfstate'
-              backendAzureRmKey: 'observability-platform.dev.tfstate'
+- stage: tfvalidate
+  displayName: 'Terraform Validation'
+  jobs:
+    - job: validate
+      displayName: 'Terraform Init and Validate'
+      steps:
 
-          - task: TerraformTaskV4@4
-            displayName: Terraform Validate
-            inputs:
-              provider: 'azurerm'
-              command: 'validate'
-              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+        - checkout: self
 
-  # - stage: tfdeploy
-  #   condition: succeeded('tfvalidate')
-  #   dependsOn: tfvalidate
-  #   jobs:
-  #     - job: apply
-  #       steps:
+        - task: TerraformInstaller@1
+          displayName: 'Install Terraform'
+          inputs:
+            terraformVersion: '1.9.8'
 
-  #         - task: TerraformInstaller@1
-  #           displayName: Install Terraform
-  #           inputs:
-  #             terraformVersion: '1.9.8'
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform Init'
+          inputs:
+            provider: 'azurerm'
+            command: 'init'
+            workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+            backendServiceArm: 'ServiceConnection-Sp'
+            backendAzureRmUseEnvironmentVariablesForAuthentication: true
+            backendAzureRmUseEntraIdForAuthentication: true
+            backendAzureRmResourceGroupName: 'rg-tfstate-observability'
+            backendAzureRmStorageAccountName: 'stobsstatedev1'
+            backendAzureRmContainerName: 'tfstate'
+            backendAzureRmKey: 'observability-platform.dev.tfstate'
 
-  #         - task: TerraformTaskV4@4
-  #           displayName: Terraform Init
-  #           inputs:
-  #             provider: 'azurerm'
-  #             command: 'init'
-  #             workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
-  #             backendServiceArm: 'ServiceConnection-Sp'
-  #             backendAzureRmResourceGroupName: 'rg-tfstate-observability'
-  #             backendAzureRmStorageAccountName: 'stobsstatedev'
-  #             backendAzureRmContainerName: 'tfstate'
-  #             backendAzureRmKey: 'observability-platform.dev.tfstate'
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform Validate'
+          inputs:
+            provider: 'azurerm'
+            command: 'validate'
+            workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
 
-  #         - task: TerraformTaskV4@4
-  #           displayName: Terraform Plan
-  #           inputs:
-  #             provider: 'azurerm'
-  #             command: 'plan'
-  #             workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
-  #             commandOptions: '-var-file="../../environments/dev/observability.tfvars" -out=tfplanfile'
-  #             environmentServiceNameAzureRM: 'ServiceConnection-Sp'
 
-  #         - task: TerraformTaskV4@4
-  #           displayName: Terraform Apply
-  #           inputs:
-  #             provider: 'azurerm'
-  #             command: 'apply'
-  #             workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
-  #             commandOptions: 'tfplanfile'
-  #             # commandOptions: '--auto-approve tfplanfile'
-  #             environmentServiceNameAzureRM: 'ServiceConnection-Sp'
-  - stage: tfdeploy
-    condition: succeeded('tfvalidate')
-    dependsOn: tfvalidate
-    jobs:
-      - job: TerraformPlan
-        displayName: Terraform Plan
-        steps:
-          - task: TerraformTaskV4@4
-            displayName: Terraform Init
-            inputs:
-              provider: 'azurerm'
-              command: 'init'
-              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
-              backendServiceArm: 'ServiceConnection-Sp'
-              backendAzureRmResourceGroupName: 'rg-tfstate-observability'
-              backendAzureRmStorageAccountName: 'stobsstatedev'
-              backendAzureRmContainerName: 'tfstate'
-              backendAzureRmKey: 'observability-platform.dev.tfstate'
-          - task: TerraformTaskV4@4
-            displayName: Terraform Plan
-            inputs:
-              provider: 'azurerm'
-              command: 'plan'
-              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
-              commandOptions: '-var-file="../../environments/dev/observability.tfvars" -out=tfplanfile'
-              environmentServiceNameAzureRM: 'ServiceConnection-Sp'
+# =====================================================
+# STAGE 2: TERRAFORM PLAN AND APPROVAL AND APPLY
+# =====================================================
 
-          # Publish the plan file for the apply job
-          - task: PublishPipelineArtifact@1
-            displayName: Publish Terraform Plan
-            inputs:
-              targetPath: '$(System.DefaultWorkingDirectory)/components/observability/tfplanfile'
-              artifact: 'terraform-plan'
+- stage: tfdeploy
+  displayName: 'Terraform Plan and Apply'
+  dependsOn: tfvalidate
+  condition: succeeded()
 
-      # 2. Manual Approval
-      - job: ManualApproval
-        displayName: Wait for Approval
-        dependsOn: TerraformPlan
-        pool: server
-        timeoutInMinutes: 60
-        steps:
-          - task: ManualValidation@1
-            displayName: Approve Terraform Apply
-            timeoutInMinutes: 60
-            inputs:
-              instructions: 'Review and approve the Terraform plan before applying changes.'
-              onTimeout: 'reject'
+  jobs:
 
-      # 3. Terraform Apply (runs only after approval)
-      - job: TerraformApply
-        displayName: Terraform Apply
-        dependsOn: ManualApproval
-        condition: succeeded()
-        steps:
-          - checkout: self
-          - task: DownloadPipelineArtifact@2
-            displayName: Download Terraform Plan
-            inputs:
-              artifact: 'terraform-plan'
-              path: '$(Pipeline.Workspace)/terraform-plan'
+    # -----------------------------------------------
+    # JOB 1: TERRAFORM PLAN
+    # -----------------------------------------------
 
-          - task: TerraformTaskV4@4
-            displayName: Terraform Init
-            inputs:
-              provider: 'azurerm'
-              command: 'init'
-              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
-              backendServiceArm: 'ServiceConnection-Sp'
-              backendAzureRmResourceGroupName: 'rg-tfstate-observability'
-              backendAzureRmStorageAccountName: 'stobsstatedev'
-              backendAzureRmContainerName: 'tfstate'
-              backendAzureRmKey: 'observability-platform.dev.tfstate'
-          - task: TerraformTaskV4@4
-            displayName: Terraform Apply
-            inputs:
-              provider: 'azurerm'
-              command: 'apply'
-              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
-              commandOptions: '$(Pipeline.Workspace)/terraform-plan/tfplanfile'
-              environmentServiceNameAzureRM: 'ServiceConnection-Sp'
-  - stage: k8s_apply
-    displayName: 'Apply K8s Manifests'
-    condition: succeeded('tfdeploy')
-    dependsOn: tfdeploy
-    jobs:
-      - job: apply_manifests
-        steps:
+    - job: TerraformPlan
+      displayName: 'Terraform Plan'
+      steps:
 
-          - task: AzureCLI@2
-            displayName: 'Apply namespace + PVC via az aks command invoke'
-            inputs:
-              azureSubscription: 'ServiceConnection-Sp'
-              scriptType: 'bash'
-              scriptLocation: 'inlineScript'
-              inlineScript: |
-                az aks command invoke \
-                  --resource-group rg-observability-dev \
-                  --name aks-observability-dev \
-                  --command "kubectl apply -f namespace.yaml -f pvc.yaml -f container-azm-ms-agentconfig.yaml" \
-                  --file $(System.DefaultWorkingDirectory)/components/observability/k8s/namespace.yaml \
-                  --file $(System.DefaultWorkingDirectory)/components/observability/k8s/pvc.yaml \
-                  --file $(System.DefaultWorkingDirectory)/components/observability/k8s/container-azm-ms-agentconfig.yaml
+        - checkout: self
+
+        - task: TerraformInstaller@1
+          displayName: 'Install Terraform'
+          inputs:
+            terraformVersion: '1.9.8'
+
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform Init'
+          inputs:
+            provider: 'azurerm'
+            command: 'init'
+            workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+            backendServiceArm: 'ServiceConnection-Sp'
+            backendAzureRmUseEnvironmentVariablesForAuthentication: true
+            backendAzureRmUseEntraIdForAuthentication: true
+            backendAzureRmResourceGroupName: 'rg-tfstate-observability'
+            backendAzureRmStorageAccountName: 'stobsstatedev1'
+            backendAzureRmContainerName: 'tfstate'
+            backendAzureRmKey: 'observability-platform.dev.tfstate'
+
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform Plan'
+          inputs:
+            provider: 'azurerm'
+            command: 'plan'
+            workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+            commandOptions: '-input=false -lock-timeout=5m -var-file="../../environments/dev/observability.tfvars" -out=tfplanfile'
+            environmentServiceNameAzureRM: 'ServiceConnection-Sp'
+
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish Terraform Plan'
+          inputs:
+            targetPath: '$(System.DefaultWorkingDirectory)/components/observability/tfplanfile'
+            artifact: 'terraform-plan'
+
+
+    # -----------------------------------------------
+    # JOB 2: MANUAL APPROVAL
+    # -----------------------------------------------
+
+    - job: ManualApproval
+      displayName: 'Wait for Manual Approval'
+      dependsOn: TerraformPlan
+      pool: server
+      timeoutInMinutes: 60
+      steps:
+
+        - task: ManualValidation@1
+          displayName: 'Approve Terraform Apply'
+          timeoutInMinutes: 60
+          inputs:
+            instructions: |
+              Review the Terraform plan.
+              Approve to continue with infrastructure deployment.
+              Reject to stop the deployment.
+            onTimeout: 'reject'
+
+
+    # -----------------------------------------------
+    # JOB 3: TERRAFORM APPLY
+    # -----------------------------------------------
+
+    - job: TerraformApply
+      displayName: 'Terraform Apply'
+      dependsOn: ManualApproval
+      condition: succeeded()
+      steps:
+
+        - checkout: self
+
+        - task: TerraformInstaller@1
+          displayName: 'Install Terraform'
+          inputs:
+            terraformVersion: '1.9.8'
+
+        - task: DownloadPipelineArtifact@2
+          displayName: 'Download Terraform Plan'
+          inputs:
+            artifact: 'terraform-plan'
+            path: '$(Pipeline.Workspace)/terraform-plan'
+
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform Init'
+          inputs:
+            provider: 'azurerm'
+            command: 'init'
+            workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+            backendServiceArm: 'ServiceConnection-Sp'
+            backendAzureRmUseEnvironmentVariablesForAuthentication: true
+            backendAzureRmUseEntraIdForAuthentication: true
+            backendAzureRmResourceGroupName: 'rg-tfstate-observability'
+            backendAzureRmStorageAccountName: 'stobsstatedev1'
+            backendAzureRmContainerName: 'tfstate'
+            backendAzureRmKey: 'observability-platform.dev.tfstate'
+
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform Apply'
+          inputs:
+            provider: 'azurerm'
+            command: 'apply'
+            workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+            commandOptions: '$(Pipeline.Workspace)/terraform-plan/tfplanfile'
+            environmentServiceNameAzureRM: 'ServiceConnection-Sp'
+
+
+# =====================================================
+# STAGE 3: KUBERNETES MANIFEST DEPLOYMENT
+# =====================================================
+
+- stage: k8s_apply
+  displayName: 'Apply Kubernetes Manifests'
+  dependsOn: tfdeploy
+  condition: succeeded()
+
+  jobs:
+    - job: apply_manifests
+      displayName: 'Deploy Kubernetes Configuration'
+      steps:
+
+        - checkout: self
+
+        - task: AzureCLI@2
+          displayName: 'Apply Kubernetes Namespace, PVC and Monitoring Configuration'
+          inputs:
+            azureSubscription: 'ServiceConnection-Sp'
+            scriptType: 'bash'
+            scriptLocation: 'inlineScript'
+            inlineScript: |
+
+              az aks command invoke \
+                --resource-group rg-observability-dev \
+                --name aks-observability-dev \
+                --command "kubectl apply -f namespace.yaml -f pvc.yaml -f container-azm-ms-agentconfig.yaml" \
+                --file "$(System.DefaultWorkingDirectory)/components/observability/k8s/namespace.yaml" \
+                --file "$(System.DefaultWorkingDirectory)/components/observability/k8s/pvc.yaml" \
+                --file "$(System.DefaultWorkingDirectory)/components/observability/k8s/container-azm-ms-agentconfig.yaml"
+```
