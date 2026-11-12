@@ -31,12 +31,12 @@ nsg_app_name   = "nsg-app-observability-dev"
 nsg_appgw_name = "nsg-appgw-observability-dev"
 nsg_pe_name    = "nsg-pe-observability-dev"
 
-acr_name = "acrobspocdev"
+acr_name = "acrobspocdev01"
 
-kv_name = "kv-obs-dev-poc"
+kv_name = "kv-obs-dev-poc01"
 kv_pe_name = "pe-obs-dev-poc"
 
-storage_account_name = "stobspocdev"
+storage_account_name = "stobspocdev01"
 
 aks_name       = "aks-observability-dev"
 aks_dns_prefix = "aks-observability-dev"
