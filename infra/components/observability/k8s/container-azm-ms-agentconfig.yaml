@@ -1,0 +1,20 @@
+# Container Insights agent settings.
+# Excludes the logging namespace (Loki/Alloy/OTel) from Log Analytics ingestion;
+# those logs already live in Loki. kube-system and gatekeeper-system are the
+# agent defaults and are kept so they stay excluded.
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: container-azm-ms-agentconfig
+  namespace: kube-system
+data:
+  schema-version: v1
+  config-version: ver1
+  log-data-collection-settings: |-
+    [log_collection_settings]
+       [log_collection_settings.stdout]
+          enabled = true
+          exclude_namespaces = ["kube-system", "gatekeeper-system", "logging"]
+       [log_collection_settings.stderr]
+          enabled = true
+          exclude_namespaces = ["kube-system", "gatekeeper-system", "logging"]

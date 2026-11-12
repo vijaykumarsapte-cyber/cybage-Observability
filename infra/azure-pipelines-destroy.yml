@@ -1,0 +1,71 @@
+trigger: none
+pr: none
+
+name: 'IaC-Observability-POC-DESTROY'
+
+parameters:
+  - name: confirmResourceGroup
+    displayName: 'Type the exact resource group name to confirm destroy (rg-observability-dev)'
+    type: string
+    default: ''
+
+pool:
+  name: 'LinuxPool'
+
+variables:
+  - group: state-data
+
+stages:
+  - stage: tfdestroy_guard
+    jobs:
+      - job: guard
+        steps:
+          - bash: |
+              if [ "${{ parameters.confirmResourceGroup }}" != "rg-observability-dev" ]; then
+                echo "##vso[task.logissue type=error]Confirmation did not match 'rg-observability-dev'. Aborting destroy."
+                exit 1
+              fi
+              echo "Confirmation matched. Proceeding to destroy."
+            displayName: 'Verify destroy confirmation'
+
+  - stage: tfdestroy
+    condition: succeeded('tfdestroy_guard')
+    dependsOn: tfdestroy_guard
+    jobs:
+      - job: destroy
+        steps:
+
+          - task: TerraformInstaller@1
+            displayName: Install Terraform
+            inputs:
+              terraformVersion: '1.9.8'
+
+          - task: TerraformTaskV4@4
+            displayName: Terraform Init
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+              backendServiceArm: 'ServiceConnection-Sp'
+              backendAzureRmResourceGroupName: 'rg-tfstate-observability'
+              backendAzureRmStorageAccountName: 'stobsstatedev'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'observability-platform.dev.tfstate'
+
+          - task: TerraformTaskV4@4
+            displayName: Terraform Plan (destroy)
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+              commandOptions: '-destroy -var-file="../../environments/dev/observability.tfvars" -out=tfdestroyplan'
+              environmentServiceNameAzureRM: 'ServiceConnection-Sp'
+
+          - task: TerraformTaskV4@4
+            displayName: Terraform Apply (destroy)
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+              commandOptions: '--auto-approve tfdestroyplan'
+              environmentServiceNameAzureRM: 'ServiceConnection-Sp'
