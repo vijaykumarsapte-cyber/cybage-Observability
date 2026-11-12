@@ -1,5 +1,6 @@
-﻿# Azure DevOps pipeline for Observability Terraform and AKS manifests
-# Manual execution only. Uses Microsoft-hosted Ubuntu; no self-hosted agent required.
+﻿# Azure DevOps pipeline - Observability Terraform + AKS
+# Does not edit or generate files in the Git repository.
+# Manual execution only; Microsoft-hosted Ubuntu agent.
 
 trigger: none
 pr: none
@@ -11,7 +12,7 @@ variables:
   azureServiceConnection: 'ServiceConnection-Sp'
   terraformVersion: '1.9.8'
 
-  # Existing Azure Blob remote state
+  # Azure Blob remote state
   stateResourceGroup: 'rg-tfstate-observability'
   stateStorageAccount: 'stobsstatedev1'
   stateContainer: 'tfstate'
@@ -19,7 +20,7 @@ variables:
   subscriptionId: '47226097-e6c5-43f7-95c7-865d71699fc9'
   tenantId: 'ea48cb28-034a-4625-85d1-159be074cfab'
 
-  # Existing AKS target
+  # AKS target
   aksResourceGroup: 'rg-observability-dev'
   aksCluster: 'aks-observability-dev'
 
@@ -34,8 +35,9 @@ stages:
     - bash: |
         set -euo pipefail
         sudo apt-get update -y
-        sudo apt-get install -y unzip curl
+        sudo apt-get install -y curl unzip
         VERSION="$(terraformVersion)"
+        mkdir -p "$(Agent.TempDirectory)/terraform-bin"
         curl -fsSLo "$(Agent.TempDirectory)/terraform.zip" \
           "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
         unzip -o "$(Agent.TempDirectory)/terraform.zip" -d "$(Agent.TempDirectory)/terraform-bin"
@@ -46,35 +48,45 @@ stages:
     - bash: |
         set -euo pipefail
         ROOT="$(Build.SourcesDirectory)"
-        echo "Repository root: $ROOT"
-        echo "Repository files and folders:"
-        find "$ROOT" -maxdepth 5 -type f | sort | head -400
+        echo "Searching for root Terraform configuration (excluding reusable modules)..."
 
-        # Prefer the known project folder if present; otherwise discover the
-        # unique directory containing Terraform configuration files.
-        if [ -d "$ROOT/components/observability" ] && \
-           find "$ROOT/components/observability" -maxdepth 1 -name '*.tf' -print -quit | grep -q .; then
-          TF_DIR="$ROOT/components/observability"
-        else
-          mapfile -t TF_DIRS < <(find "$ROOT" -type f -name '*.tf' \
-            -not -path '*/.terraform/*' -printf '%h\n' | sort -u)
-          if [ "${#TF_DIRS[@]}" -eq 0 ]; then
-            echo "ERROR: No Terraform (.tf) files found in the checked-out repository."
-            exit 1
-          elif [ "${#TF_DIRS[@]}" -eq 1 ]; then
-            TF_DIR="${TF_DIRS[0]}"
-          else
-            echo "ERROR: More than one Terraform directory found. Set the correct Terraform directory explicitly."
-            printf 'Candidate: %s\n' "${TF_DIRS[@]}"
-            exit 1
-          fi
+        # First choice: a non-module directory containing module blocks.
+        mapfile -t ROOT_CANDIDATES < <(
+          find "$ROOT" -type f -name '*.tf' \
+            -not -path '*/.terraform/*' \
+            -not -path '*/modules/*' -print0 |
+          xargs -0 -r grep -lE '^[[:space:]]*module[[:space:]]+"' |
+          xargs -r -n1 dirname | sort -u
+        )
+
+        # Fallback: a non-module directory containing Terraform files.
+        if [ "${#ROOT_CANDIDATES[@]}" -eq 0 ]; then
+          mapfile -t ROOT_CANDIDATES < <(
+            find "$ROOT" -type f -name '*.tf' \
+              -not -path '*/.terraform/*' \
+              -not -path '*/modules/*' -printf '%h\n' | sort -u
+          )
         fi
 
-        echo "Using Terraform directory: $TF_DIR"
+        if [ "${#ROOT_CANDIDATES[@]}" -ne 1 ]; then
+          echo "ERROR: Could not identify exactly one Terraform root directory."
+          echo "Terraform directories outside reusable modules:"
+          find "$ROOT" -type f -name '*.tf' \
+            -not -path '*/.terraform/*' \
+            -not -path '*/modules/*' -printf '%h\n' | sort -u || true
+          echo "Root candidates:"
+          printf '%s\n' "${ROOT_CANDIDATES[@]}"
+          echo "No repository files have been changed."
+          exit 1
+        fi
+
+        TF_DIR="${ROOT_CANDIDATES[0]}"
+        echo "Selected Terraform root: $TF_DIR"
+
         terraform -chdir="$TF_DIR" fmt -check -recursive
         terraform -chdir="$TF_DIR" init -backend=false -input=false
         terraform -chdir="$TF_DIR" validate
-      displayName: 'Discover Terraform folder, format and validate'
+      displayName: 'Detect Terraform root, format and validate'
 
 - stage: Plan
   displayName: 'Terraform plan'
@@ -88,8 +100,9 @@ stages:
     - bash: |
         set -euo pipefail
         sudo apt-get update -y
-        sudo apt-get install -y unzip curl
+        sudo apt-get install -y curl unzip
         VERSION="$(terraformVersion)"
+        mkdir -p "$(Agent.TempDirectory)/terraform-bin"
         curl -fsSLo "$(Agent.TempDirectory)/terraform.zip" \
           "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
         unzip -o "$(Agent.TempDirectory)/terraform.zip" -d "$(Agent.TempDirectory)/terraform-bin"
@@ -98,7 +111,7 @@ stages:
       displayName: 'Install Terraform'
 
     - task: AzureCLI@2
-      displayName: 'Initialize remote state and create Terraform plan using OIDC'
+      displayName: 'Terraform init and plan using Azure OIDC'
       inputs:
         azureSubscription: '$(azureServiceConnection)'
         scriptType: bash
@@ -108,38 +121,49 @@ stages:
           set -euo pipefail
           ROOT="$(Build.SourcesDirectory)"
 
-          if [ -d "$ROOT/components/observability" ] && \
-             find "$ROOT/components/observability" -maxdepth 1 -name '*.tf' -print -quit | grep -q .; then
-            TF_DIR="$ROOT/components/observability"
-          else
-            mapfile -t TF_DIRS < <(find "$ROOT" -type f -name '*.tf' \
-              -not -path '*/.terraform/*' -printf '%h\n' | sort -u)
-            if [ "${#TF_DIRS[@]}" -ne 1 ]; then
-              echo "ERROR: Expected exactly one Terraform directory; found ${#TF_DIRS[@]}."
-              printf 'Candidate: %s\n' "${TF_DIRS[@]}"
-              exit 1
-            fi
-            TF_DIR="${TF_DIRS[0]}"
+          mapfile -t ROOT_CANDIDATES < <(
+            find "$ROOT" -type f -name '*.tf' \
+              -not -path '*/.terraform/*' \
+              -not -path '*/modules/*' -print0 |
+            xargs -0 -r grep -lE '^[[:space:]]*module[[:space:]]+"' |
+            xargs -r -n1 dirname | sort -u
+          )
+          if [ "${#ROOT_CANDIDATES[@]}" -eq 0 ]; then
+            mapfile -t ROOT_CANDIDATES < <(
+              find "$ROOT" -type f -name '*.tf' \
+                -not -path '*/.terraform/*' \
+                -not -path '*/modules/*' -printf '%h\n' | sort -u
+            )
           fi
+          if [ "${#ROOT_CANDIDATES[@]}" -ne 1 ]; then
+            echo "ERROR: Expected one Terraform root directory; found ${#ROOT_CANDIDATES[@]}."
+            printf 'Candidate: %s\n' "${ROOT_CANDIDATES[@]}"
+            exit 1
+          fi
+          TF_DIR="${ROOT_CANDIDATES[0]}"
 
-          # Find the expected tfvars file anywhere in the repository.
-          mapfile -t VAR_FILES < <(find "$ROOT" -type f -name 'observability.tfvars' \
-            -not -path '*/.terraform/*' | sort)
+          # Find the environment tfvars file. Prefer the named observability file.
+          mapfile -t VAR_FILES < <(
+            find "$ROOT" -type f -name 'observability.tfvars' \
+              -not -path '*/.terraform/*' | sort
+          )
           if [ "${#VAR_FILES[@]}" -eq 0 ]; then
-            mapfile -t VAR_FILES < <(find "$ROOT" -type f -name '*.tfvars' \
-              -not -path '*/.terraform/*' | sort)
+            mapfile -t VAR_FILES < <(
+              find "$ROOT" -type f -name '*.tfvars' \
+                -not -path '*/.terraform/*' | sort
+            )
           fi
           if [ "${#VAR_FILES[@]}" -ne 1 ]; then
             echo "ERROR: Expected exactly one observability.tfvars or .tfvars file; found ${#VAR_FILES[@]}."
-            printf 'Candidate: %s\n' "${VAR_FILES[@]}"
+            printf 'tfvars candidate: %s\n' "${VAR_FILES[@]}"
             exit 1
           fi
           VAR_FILE="${VAR_FILES[0]}"
 
-          echo "Terraform directory: $TF_DIR"
-          echo "Variables file: $VAR_FILE"
+          echo "Terraform root: $TF_DIR"
+          echo "Terraform variables file: $VAR_FILE"
 
-          # AzureCLI@2 exposes these values when addSpnToEnvironment is true.
+          # AzureCLI@2 supplies the federated identity values for this service connection.
           export ARM_CLIENT_ID="$servicePrincipalId"
           export ARM_TENANT_ID="$(tenantId)"
           export ARM_SUBSCRIPTION_ID="$(subscriptionId)"
@@ -168,7 +192,7 @@ stages:
       displayName: 'Publish Terraform plan'
 
 - stage: Approval
-  displayName: 'Manual approval'
+  displayName: 'Manual approval before apply'
   dependsOn: Plan
   condition: succeeded()
   jobs:
@@ -181,9 +205,10 @@ stages:
       inputs:
         notifyUsers: ''
         instructions: |
-          Review the Terraform plan artifact from the Plan stage.
-          Approve only after confirming the subscription, state key,
-          and all proposed changes. Reject unexpected replacements/deletions.
+          Review the Terraform plan artifact produced by the Plan stage.
+          Verify the Azure subscription, remote-state key, and all proposed
+          changes. Reject the run if unexpected resources will be deleted
+          or replaced. Approve only when the plan is correct.
         onTimeout: 'reject'
 
 - stage: Apply
@@ -197,13 +222,14 @@ stages:
 
     - download: current
       artifact: 'terraform-plan'
-      displayName: 'Download Terraform plan'
+      displayName: 'Download approved Terraform plan'
 
     - bash: |
         set -euo pipefail
         sudo apt-get update -y
-        sudo apt-get install -y unzip curl
+        sudo apt-get install -y curl unzip
         VERSION="$(terraformVersion)"
+        mkdir -p "$(Agent.TempDirectory)/terraform-bin"
         curl -fsSLo "$(Agent.TempDirectory)/terraform.zip" \
           "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
         unzip -o "$(Agent.TempDirectory)/terraform.zip" -d "$(Agent.TempDirectory)/terraform-bin"
@@ -212,7 +238,7 @@ stages:
       displayName: 'Install Terraform'
 
     - task: AzureCLI@2
-      displayName: 'Initialize remote state and apply approved plan using OIDC'
+      displayName: 'Terraform init and apply approved plan using Azure OIDC'
       inputs:
         azureSubscription: '$(azureServiceConnection)'
         scriptType: bash
@@ -222,19 +248,26 @@ stages:
           set -euo pipefail
           ROOT="$(Build.SourcesDirectory)"
 
-          if [ -d "$ROOT/components/observability" ] && \
-             find "$ROOT/components/observability" -maxdepth 1 -name '*.tf' -print -quit | grep -q .; then
-            TF_DIR="$ROOT/components/observability"
-          else
-            mapfile -t TF_DIRS < <(find "$ROOT" -type f -name '*.tf' \
-              -not -path '*/.terraform/*' -printf '%h\n' | sort -u)
-            if [ "${#TF_DIRS[@]}" -ne 1 ]; then
-              echo "ERROR: Expected exactly one Terraform directory; found ${#TF_DIRS[@]}."
-              printf 'Candidate: %s\n' "${TF_DIRS[@]}"
-              exit 1
-            fi
-            TF_DIR="${TF_DIRS[0]}"
+          mapfile -t ROOT_CANDIDATES < <(
+            find "$ROOT" -type f -name '*.tf' \
+              -not -path '*/.terraform/*' \
+              -not -path '*/modules/*' -print0 |
+            xargs -0 -r grep -lE '^[[:space:]]*module[[:space:]]+"' |
+            xargs -r -n1 dirname | sort -u
+          )
+          if [ "${#ROOT_CANDIDATES[@]}" -eq 0 ]; then
+            mapfile -t ROOT_CANDIDATES < <(
+              find "$ROOT" -type f -name '*.tf' \
+                -not -path '*/.terraform/*' \
+                -not -path '*/modules/*' -printf '%h\n' | sort -u
+            )
           fi
+          if [ "${#ROOT_CANDIDATES[@]}" -ne 1 ]; then
+            echo "ERROR: Expected one Terraform root directory; found ${#ROOT_CANDIDATES[@]}."
+            printf 'Candidate: %s\n' "${ROOT_CANDIDATES[@]}"
+            exit 1
+          fi
+          TF_DIR="${ROOT_CANDIDATES[0]}"
 
           export ARM_CLIENT_ID="$servicePrincipalId"
           export ARM_TENANT_ID="$(tenantId)"
@@ -254,7 +287,7 @@ stages:
 
           PLAN_FILE="$(Pipeline.Workspace)/terraform-plan/tfplan"
           if [ ! -f "$PLAN_FILE" ]; then
-            echo "ERROR: Approved Terraform plan artifact not found: $PLAN_FILE"
+            echo "ERROR: Terraform plan artifact not found: $PLAN_FILE"
             exit 1
           fi
 
@@ -267,7 +300,7 @@ stages:
   dependsOn: Apply
   condition: succeeded()
   jobs:
-  - job: ApplyManifests
+  - job: DeployManifests
     steps:
     - checkout: self
 
@@ -281,35 +314,35 @@ stages:
           set -euo pipefail
           ROOT="$(Build.SourcesDirectory)"
 
-          # Discover the directory containing the expected manifest files.
+          # Locate the directory containing all three expected manifest files.
           mapfile -t MANIFEST_DIRS < <(
-            find "$ROOT" -type f -name 'namespace.yaml' -printf '%h\n' |
-            while read -r dir; do
-              if [ -f "$dir/pvc.yaml" ] && [ -f "$dir/container-azm-ms-agentconfig.yaml" ]; then
-                echo "$dir"
+            find "$ROOT" -type f -name 'namespace.yaml' -not -path '*/.git/*' -printf '%h\n' |
+            while IFS= read -r DIR; do
+              if [ -f "$DIR/pvc.yaml" ] && [ -f "$DIR/container-azm-ms-agentconfig.yaml" ]; then
+                printf '%s\n' "$DIR"
               fi
             done | sort -u
           )
 
           if [ "${#MANIFEST_DIRS[@]}" -ne 1 ]; then
-            echo "ERROR: Expected exactly one folder containing namespace.yaml, pvc.yaml and container-azm-ms-agentconfig.yaml."
-            printf 'Candidate: %s\n' "${MANIFEST_DIRS[@]}"
+            echo "ERROR: Expected one folder containing namespace.yaml, pvc.yaml and container-azm-ms-agentconfig.yaml."
+            printf 'Manifest folder candidate: %s\n' "${MANIFEST_DIRS[@]}"
             exit 1
           fi
           K8S_DIR="${MANIFEST_DIRS[0]}"
-          echo "Using Kubernetes manifests from: $K8S_DIR"
+          echo "Kubernetes manifest directory: $K8S_DIR"
 
           az aks show \
             --resource-group "$(aksResourceGroup)" \
             --name "$(aksCluster)" \
             --output table
 
-          for manifest in namespace.yaml pvc.yaml container-azm-ms-agentconfig.yaml; do
+          for MANIFEST in namespace.yaml pvc.yaml container-azm-ms-agentconfig.yaml; do
             az aks command invoke \
               --resource-group "$(aksResourceGroup)" \
               --name "$(aksCluster)" \
-              --command "kubectl apply -f $manifest" \
-              --file "$K8S_DIR/$manifest"
+              --command "kubectl apply -f $MANIFEST" \
+              --file "$K8S_DIR/$MANIFEST"
           done
 
-          echo "Kubernetes manifests applied."
+          echo "Kubernetes manifests applied successfully."
