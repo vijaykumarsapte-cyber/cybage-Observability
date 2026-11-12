@@ -6,7 +6,7 @@ pr: none
 name: 'IaC-Observability-POC'
 
 pool:
-  name: LinuxPool
+  name: ubuntu-latest
 
 variables:
 
