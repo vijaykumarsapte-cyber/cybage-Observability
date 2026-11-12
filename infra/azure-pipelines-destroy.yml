@@ -1,4 +1,4 @@
-trigger: none
+﻿trigger: none
 pr: none
 
 name: 'IaC-Observability-POC-DESTROY'
@@ -13,7 +13,6 @@ pool:
   name: 'LinuxPool'
 
 variables:
-  - group: state-data
 
 stages:
   - stage: tfdestroy_guard

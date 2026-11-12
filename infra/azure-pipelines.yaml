@@ -1,4 +1,4 @@
-# Azure Observability Infrastructure Pipeline
+﻿# Azure Observability Infrastructure Pipeline
 
 trigger: none
 pr: none
@@ -9,7 +9,6 @@ pool:
   name: LinuxPool
 
 variables:
-  - group: state-data
 
   - name: azureServiceConnection
     value: 'ServiceConnection-Sp'
