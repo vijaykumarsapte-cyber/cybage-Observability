@@ -1,6 +1,5 @@
-﻿# Azure DevOps pipeline: Terraform + AKS observability deployment
-# Uses Microsoft-hosted Ubuntu agents. No local agent installation is required.
-# IMPORTANT: Review the Terraform plan and approve the manual validation before apply.
+﻿# Azure DevOps pipeline for Observability Terraform and AKS manifests
+# Manual execution only. Uses Microsoft-hosted Ubuntu; no self-hosted agent required.
 
 trigger: none
 pr: none
@@ -12,11 +11,7 @@ variables:
   azureServiceConnection: 'ServiceConnection-Sp'
   terraformVersion: '1.9.8'
 
-  # Terraform working directory and variables file
-  terraformWorkingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
-  terraformVarFile: '$(System.DefaultWorkingDirectory)/environments/dev/observability.tfvars'
-
-  # Azure Blob remote state
+  # Existing Azure Blob remote state
   stateResourceGroup: 'rg-tfstate-observability'
   stateStorageAccount: 'stobsstatedev1'
   stateContainer: 'tfstate'
@@ -24,69 +19,86 @@ variables:
   subscriptionId: '47226097-e6c5-43f7-95c7-865d71699fc9'
   tenantId: 'ea48cb28-034a-4625-85d1-159be074cfab'
 
-  # AKS target
+  # Existing AKS target
   aksResourceGroup: 'rg-observability-dev'
   aksCluster: 'aks-observability-dev'
 
 stages:
 - stage: Validate
-  displayName: 'Terraform format and validation'
+  displayName: 'Terraform validation'
   jobs:
-  - job: TerraformValidate
-    displayName: 'Install Terraform and validate configuration'
+  - job: ValidateTerraform
     steps:
     - checkout: self
 
-    # Install Terraform directly to avoid dependency on TerraformInstaller@1
-    # or TerraformTaskV4@4 Marketplace extensions.
     - bash: |
         set -euo pipefail
-        TERRAFORM_VERSION="$(terraformVersion)"
-        mkdir -p "$(Agent.TempDirectory)/terraform"
-        cd "$(Agent.TempDirectory)/terraform"
-        curl -fsSLo terraform.zip \
-          "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
-        unzip -o terraform.zip
-        sudo install -m 0755 terraform /usr/local/bin/terraform
-        echo "Terraform installed:"
-        command -v terraform
+        sudo apt-get update -y
+        sudo apt-get install -y unzip curl
+        VERSION="$(terraformVersion)"
+        curl -fsSLo "$(Agent.TempDirectory)/terraform.zip" \
+          "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+        unzip -o "$(Agent.TempDirectory)/terraform.zip" -d "$(Agent.TempDirectory)/terraform-bin"
+        sudo install -m 0755 "$(Agent.TempDirectory)/terraform-bin/terraform" /usr/local/bin/terraform
         terraform version
-      displayName: 'Install Terraform $(terraformVersion)'
+      displayName: 'Install Terraform'
 
     - bash: |
         set -euo pipefail
-        cd "$(terraformWorkingDirectory)"
-        terraform fmt -check -recursive
-        terraform init -backend=false -input=false
-        terraform validate
-      displayName: 'Terraform fmt, init and validate'
+        ROOT="$(Build.SourcesDirectory)"
+        echo "Repository root: $ROOT"
+        echo "Repository files and folders:"
+        find "$ROOT" -maxdepth 5 -type f | sort | head -400
+
+        # Prefer the known project folder if present; otherwise discover the
+        # unique directory containing Terraform configuration files.
+        if [ -d "$ROOT/components/observability" ] && \
+           find "$ROOT/components/observability" -maxdepth 1 -name '*.tf' -print -quit | grep -q .; then
+          TF_DIR="$ROOT/components/observability"
+        else
+          mapfile -t TF_DIRS < <(find "$ROOT" -type f -name '*.tf' \
+            -not -path '*/.terraform/*' -printf '%h\n' | sort -u)
+          if [ "${#TF_DIRS[@]}" -eq 0 ]; then
+            echo "ERROR: No Terraform (.tf) files found in the checked-out repository."
+            exit 1
+          elif [ "${#TF_DIRS[@]}" -eq 1 ]; then
+            TF_DIR="${TF_DIRS[0]}"
+          else
+            echo "ERROR: More than one Terraform directory found. Set the correct Terraform directory explicitly."
+            printf 'Candidate: %s\n' "${TF_DIRS[@]}"
+            exit 1
+          fi
+        fi
+
+        echo "Using Terraform directory: $TF_DIR"
+        terraform -chdir="$TF_DIR" fmt -check -recursive
+        terraform -chdir="$TF_DIR" init -backend=false -input=false
+        terraform -chdir="$TF_DIR" validate
+      displayName: 'Discover Terraform folder, format and validate'
 
 - stage: Plan
   displayName: 'Terraform plan'
   dependsOn: Validate
   condition: succeeded()
   jobs:
-  - job: TerraformPlan
-    displayName: 'Initialize remote state and create plan'
+  - job: CreatePlan
     steps:
     - checkout: self
 
     - bash: |
         set -euo pipefail
-        TERRAFORM_VERSION="$(terraformVersion)"
-        mkdir -p "$(Agent.TempDirectory)/terraform"
-        cd "$(Agent.TempDirectory)/terraform"
-        curl -fsSLo terraform.zip \
-          "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
-        unzip -o terraform.zip
-        sudo install -m 0755 terraform /usr/local/bin/terraform
+        sudo apt-get update -y
+        sudo apt-get install -y unzip curl
+        VERSION="$(terraformVersion)"
+        curl -fsSLo "$(Agent.TempDirectory)/terraform.zip" \
+          "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+        unzip -o "$(Agent.TempDirectory)/terraform.zip" -d "$(Agent.TempDirectory)/terraform-bin"
+        sudo install -m 0755 "$(Agent.TempDirectory)/terraform-bin/terraform" /usr/local/bin/terraform
         terraform version
-      displayName: 'Install Terraform $(terraformVersion)'
+      displayName: 'Install Terraform'
 
-    # AzureCLI@2 obtains the federated OIDC token from the service connection.
-    # The ARM_* variables let the Terraform azurerm backend authenticate with OIDC.
     - task: AzureCLI@2
-      displayName: 'Terraform init and plan (OIDC)'
+      displayName: 'Initialize remote state and create Terraform plan using OIDC'
       inputs:
         azureSubscription: '$(azureServiceConnection)'
         scriptType: bash
@@ -94,16 +106,47 @@ stages:
         addSpnToEnvironment: true
         inlineScript: |
           set -euo pipefail
+          ROOT="$(Build.SourcesDirectory)"
 
+          if [ -d "$ROOT/components/observability" ] && \
+             find "$ROOT/components/observability" -maxdepth 1 -name '*.tf' -print -quit | grep -q .; then
+            TF_DIR="$ROOT/components/observability"
+          else
+            mapfile -t TF_DIRS < <(find "$ROOT" -type f -name '*.tf' \
+              -not -path '*/.terraform/*' -printf '%h\n' | sort -u)
+            if [ "${#TF_DIRS[@]}" -ne 1 ]; then
+              echo "ERROR: Expected exactly one Terraform directory; found ${#TF_DIRS[@]}."
+              printf 'Candidate: %s\n' "${TF_DIRS[@]}"
+              exit 1
+            fi
+            TF_DIR="${TF_DIRS[0]}"
+          fi
+
+          # Find the expected tfvars file anywhere in the repository.
+          mapfile -t VAR_FILES < <(find "$ROOT" -type f -name 'observability.tfvars' \
+            -not -path '*/.terraform/*' | sort)
+          if [ "${#VAR_FILES[@]}" -eq 0 ]; then
+            mapfile -t VAR_FILES < <(find "$ROOT" -type f -name '*.tfvars' \
+              -not -path '*/.terraform/*' | sort)
+          fi
+          if [ "${#VAR_FILES[@]}" -ne 1 ]; then
+            echo "ERROR: Expected exactly one observability.tfvars or .tfvars file; found ${#VAR_FILES[@]}."
+            printf 'Candidate: %s\n' "${VAR_FILES[@]}"
+            exit 1
+          fi
+          VAR_FILE="${VAR_FILES[0]}"
+
+          echo "Terraform directory: $TF_DIR"
+          echo "Variables file: $VAR_FILE"
+
+          # AzureCLI@2 exposes these values when addSpnToEnvironment is true.
           export ARM_CLIENT_ID="$servicePrincipalId"
-          export ARM_TENANT_ID="$tenantId"
+          export ARM_TENANT_ID="$(tenantId)"
           export ARM_SUBSCRIPTION_ID="$(subscriptionId)"
           export ARM_USE_OIDC=true
           export ARM_OIDC_TOKEN="$idToken"
 
-          cd "$(terraformWorkingDirectory)"
-
-          terraform init -input=false \
+          terraform -chdir="$TF_DIR" init -input=false \
             -backend-config="resource_group_name=$(stateResourceGroup)" \
             -backend-config="storage_account_name=$(stateStorageAccount)" \
             -backend-config="container_name=$(stateContainer)" \
@@ -113,8 +156,9 @@ stages:
             -backend-config="use_azuread_auth=true" \
             -backend-config="use_oidc=true"
 
-          terraform plan -input=false \
-            -var-file="$(terraformVarFile)" \
+          mkdir -p "$(Build.ArtifactStagingDirectory)"
+          terraform -chdir="$TF_DIR" plan -input=false \
+            -var-file="$VAR_FILE" \
             -out="$(Build.ArtifactStagingDirectory)/tfplan"
       env:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
@@ -124,12 +168,11 @@ stages:
       displayName: 'Publish Terraform plan'
 
 - stage: Approval
-  displayName: 'Manual approval before infrastructure changes'
+  displayName: 'Manual approval'
   dependsOn: Plan
   condition: succeeded()
   jobs:
   - job: WaitForApproval
-    displayName: 'Review and approve Terraform plan'
     pool: server
     timeoutInMinutes: 1440
     steps:
@@ -138,10 +181,9 @@ stages:
       inputs:
         notifyUsers: ''
         instructions: |
-          Review the Terraform plan from the preceding Plan stage.
-          Confirm the subscription, resource group, and planned changes.
-          Approve only if the plan is expected. Reject if it proposes
-          unexpected resource replacement or deletion.
+          Review the Terraform plan artifact from the Plan stage.
+          Approve only after confirming the subscription, state key,
+          and all proposed changes. Reject unexpected replacements/deletions.
         onTimeout: 'reject'
 
 - stage: Apply
@@ -149,29 +191,28 @@ stages:
   dependsOn: Approval
   condition: succeeded()
   jobs:
-  - job: TerraformApply
-    displayName: 'Apply approved Terraform plan'
+  - job: ApplyApprovedPlan
     steps:
     - checkout: self
 
     - download: current
       artifact: 'terraform-plan'
-      displayName: 'Download approved Terraform plan'
+      displayName: 'Download Terraform plan'
 
     - bash: |
         set -euo pipefail
-        TERRAFORM_VERSION="$(terraformVersion)"
-        mkdir -p "$(Agent.TempDirectory)/terraform"
-        cd "$(Agent.TempDirectory)/terraform"
-        curl -fsSLo terraform.zip \
-          "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
-        unzip -o terraform.zip
-        sudo install -m 0755 terraform /usr/local/bin/terraform
+        sudo apt-get update -y
+        sudo apt-get install -y unzip curl
+        VERSION="$(terraformVersion)"
+        curl -fsSLo "$(Agent.TempDirectory)/terraform.zip" \
+          "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+        unzip -o "$(Agent.TempDirectory)/terraform.zip" -d "$(Agent.TempDirectory)/terraform-bin"
+        sudo install -m 0755 "$(Agent.TempDirectory)/terraform-bin/terraform" /usr/local/bin/terraform
         terraform version
-      displayName: 'Install Terraform $(terraformVersion)'
+      displayName: 'Install Terraform'
 
     - task: AzureCLI@2
-      displayName: 'Terraform init and apply approved plan (OIDC)'
+      displayName: 'Initialize remote state and apply approved plan using OIDC'
       inputs:
         azureSubscription: '$(azureServiceConnection)'
         scriptType: bash
@@ -179,16 +220,29 @@ stages:
         addSpnToEnvironment: true
         inlineScript: |
           set -euo pipefail
+          ROOT="$(Build.SourcesDirectory)"
+
+          if [ -d "$ROOT/components/observability" ] && \
+             find "$ROOT/components/observability" -maxdepth 1 -name '*.tf' -print -quit | grep -q .; then
+            TF_DIR="$ROOT/components/observability"
+          else
+            mapfile -t TF_DIRS < <(find "$ROOT" -type f -name '*.tf' \
+              -not -path '*/.terraform/*' -printf '%h\n' | sort -u)
+            if [ "${#TF_DIRS[@]}" -ne 1 ]; then
+              echo "ERROR: Expected exactly one Terraform directory; found ${#TF_DIRS[@]}."
+              printf 'Candidate: %s\n' "${TF_DIRS[@]}"
+              exit 1
+            fi
+            TF_DIR="${TF_DIRS[0]}"
+          fi
 
           export ARM_CLIENT_ID="$servicePrincipalId"
-          export ARM_TENANT_ID="$tenantId"
+          export ARM_TENANT_ID="$(tenantId)"
           export ARM_SUBSCRIPTION_ID="$(subscriptionId)"
           export ARM_USE_OIDC=true
           export ARM_OIDC_TOKEN="$idToken"
 
-          cd "$(terraformWorkingDirectory)"
-
-          terraform init -input=false \
+          terraform -chdir="$TF_DIR" init -input=false \
             -backend-config="resource_group_name=$(stateResourceGroup)" \
             -backend-config="storage_account_name=$(stateStorageAccount)" \
             -backend-config="container_name=$(stateContainer)" \
@@ -198,65 +252,64 @@ stages:
             -backend-config="use_azuread_auth=true" \
             -backend-config="use_oidc=true"
 
-          terraform apply -input=false -auto-approve \
-            "$(Pipeline.Workspace)/terraform-plan/tfplan"
+          PLAN_FILE="$(Pipeline.Workspace)/terraform-plan/tfplan"
+          if [ ! -f "$PLAN_FILE" ]; then
+            echo "ERROR: Approved Terraform plan artifact not found: $PLAN_FILE"
+            exit 1
+          fi
+
+          terraform -chdir="$TF_DIR" apply -input=false -auto-approve "$PLAN_FILE"
       env:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
 - stage: DeployKubernetes
-  displayName: 'Deploy observability Kubernetes manifests'
+  displayName: 'Deploy Kubernetes manifests'
   dependsOn: Apply
   condition: succeeded()
   jobs:
-  - job: DeployManifests
-    displayName: 'Apply Kubernetes YAML files to AKS'
+  - job: ApplyManifests
     steps:
     - checkout: self
 
     - task: AzureCLI@2
-      displayName: 'Deploy manifests using AKS command invoke'
+      displayName: 'Apply observability manifests to AKS'
       inputs:
         azureSubscription: '$(azureServiceConnection)'
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
           set -euo pipefail
+          ROOT="$(Build.SourcesDirectory)"
 
-          K8S_DIR="$(Build.SourcesDirectory)/components/observability/k8s"
+          # Discover the directory containing the expected manifest files.
+          mapfile -t MANIFEST_DIRS < <(
+            find "$ROOT" -type f -name 'namespace.yaml' -printf '%h\n' |
+            while read -r dir; do
+              if [ -f "$dir/pvc.yaml" ] && [ -f "$dir/container-azm-ms-agentconfig.yaml" ]; then
+                echo "$dir"
+              fi
+            done | sort -u
+          )
 
-          if [ ! -d "$K8S_DIR" ]; then
-            echo "ERROR: Kubernetes manifest directory not found: $K8S_DIR"
+          if [ "${#MANIFEST_DIRS[@]}" -ne 1 ]; then
+            echo "ERROR: Expected exactly one folder containing namespace.yaml, pvc.yaml and container-azm-ms-agentconfig.yaml."
+            printf 'Candidate: %s\n' "${MANIFEST_DIRS[@]}"
             exit 1
           fi
-
-          for manifest in namespace.yaml pvc.yaml container-azm-ms-agentconfig.yaml; do
-            if [ ! -f "$K8S_DIR/$manifest" ]; then
-              echo "ERROR: Required manifest not found: $K8S_DIR/$manifest"
-              exit 1
-            fi
-          done
+          K8S_DIR="${MANIFEST_DIRS[0]}"
+          echo "Using Kubernetes manifests from: $K8S_DIR"
 
           az aks show \
             --resource-group "$(aksResourceGroup)" \
             --name "$(aksCluster)" \
             --output table
 
-          az aks command invoke \
-            --resource-group "$(aksResourceGroup)" \
-            --name "$(aksCluster)" \
-            --command "kubectl apply -f namespace.yaml" \
-            --file "$K8S_DIR/namespace.yaml"
+          for manifest in namespace.yaml pvc.yaml container-azm-ms-agentconfig.yaml; do
+            az aks command invoke \
+              --resource-group "$(aksResourceGroup)" \
+              --name "$(aksCluster)" \
+              --command "kubectl apply -f $manifest" \
+              --file "$K8S_DIR/$manifest"
+          done
 
-          az aks command invoke \
-            --resource-group "$(aksResourceGroup)" \
-            --name "$(aksCluster)" \
-            --command "kubectl apply -f pvc.yaml" \
-            --file "$K8S_DIR/pvc.yaml"
-
-          az aks command invoke \
-            --resource-group "$(aksResourceGroup)" \
-            --name "$(aksCluster)" \
-            --command "kubectl apply -f container-azm-ms-agentconfig.yaml" \
-            --file "$K8S_DIR/container-azm-ms-agentconfig.yaml"
-
-          echo "Kubernetes manifests applied successfully."
+          echo "Kubernetes manifests applied."
