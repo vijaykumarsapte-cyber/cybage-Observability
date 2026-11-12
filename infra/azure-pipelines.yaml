@@ -1,182 +1,185 @@
-﻿# Azure DevOps pipeline - Observability Terraform + AKS
-# Manual execution only. Uses Microsoft-hosted Ubuntu.
-# SAFE MODE: Validate + Terraform Plan only; no apply or Kubernetes deployment.
-# This pipeline does not create, update, or delete Azure infrastructure.
-# No Git repository files are committed or pushed by this pipeline.
-# terraform fmt may format the temporary agent checkout only.
+﻿trigger: none
 
-trigger: none
-pr: none
+name: 'IaC-Observability-POC'
 
 pool:
-  vmImage: 'ubuntu-latest'
+  name: 'LinuxPool'
 
 variables:
-  azureServiceConnection: 'ServiceConnection-Sp'
-  terraformVersion: '1.9.8'
-
-  # Confirmed from the latest pipeline log
-  terraformWorkingDirectory: '$(Build.SourcesDirectory)/infra/components/observability'
-
-  # Azure Blob remote state
-  stateResourceGroup: 'rg-tfstate-observability'
-  stateStorageAccount: 'stobsstatedev1'
-  stateContainer: 'tfstate'
-  stateKey: 'observability-platform.dev.tfstate'
-  subscriptionId: '47226097-e6c5-43f7-95c7-865d71699fc9'
-  tenantId: 'ea48cb28-034a-4625-85d1-159be074cfab'
-
-  # AKS target
-  aksResourceGroup: 'rg-observability-dev'
-  aksCluster: 'aks-observability-dev'
+  - group: state-data
 
 stages:
-- stage: Validate
-  displayName: 'Terraform format and validation'
-  jobs:
-  - job: ValidateTerraform
-    displayName: 'Validate Terraform configuration'
-    steps:
-    - checkout: self
+  - stage: tfvalidate
+    jobs:
+      - job: validate
+        continueOnError: false
+        steps:
 
-    - bash: |
-        set -euo pipefail
-        sudo apt-get update -y
-        sudo apt-get install -y curl unzip
-        VERSION="$(terraformVersion)"
-        mkdir -p "$(Agent.TempDirectory)/terraform-bin"
-        curl -fsSLo "$(Agent.TempDirectory)/terraform.zip" \
-          "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
-        unzip -o "$(Agent.TempDirectory)/terraform.zip" -d "$(Agent.TempDirectory)/terraform-bin"
-        sudo install -m 0755 "$(Agent.TempDirectory)/terraform-bin/terraform" /usr/local/bin/terraform
-        terraform version
-      displayName: 'Install Terraform $(terraformVersion)'
+          - task: TerraformInstaller@1
+            displayName: Install Terraform
+            inputs:
+              terraformVersion: '1.9.8'
 
-    - bash: |
-        set -euo pipefail
-        TF_DIR="$(terraformWorkingDirectory)"
+          - task: TerraformTaskV4@4
+            displayName: Terraform Init
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+              backendServiceArm: 'ServiceConnection-Sp'
+              backendAzureRmResourceGroupName: 'rg-tfstate-observability'
+              backendAzureRmStorageAccountName: 'stobsstatedev'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'observability-platform.dev.tfstate'
 
-        if [ ! -d "$TF_DIR" ]; then
-          echo "ERROR: Terraform root directory does not exist: $TF_DIR"
-          exit 1
-        fi
-        if [ ! -f "$TF_DIR/main.tf" ]; then
-          echo "ERROR: main.tf not found in $TF_DIR"
-          exit 1
-        fi
+          - task: TerraformTaskV4@4
+            displayName: Terraform Validate
+            inputs:
+              provider: 'azurerm'
+              command: 'validate'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
 
-        echo "Using confirmed Terraform root: $TF_DIR"
-        echo "Terraform files:"
-        find "$TF_DIR" -maxdepth 2 -type f -name '*.tf' -print | sort
+  # - stage: tfdeploy
+  #   condition: succeeded('tfvalidate')
+  #   dependsOn: tfvalidate
+  #   jobs:
+  #     - job: apply
+  #       steps:
 
-        # Formats only the agent's temporary checkout; no commit or push is performed.
-        terraform -chdir="$TF_DIR" fmt -recursive
+  #         - task: TerraformInstaller@1
+  #           displayName: Install Terraform
+  #           inputs:
+  #             terraformVersion: '1.9.8'
 
-        terraform -chdir="$TF_DIR" init -backend=false -input=false
-        terraform -chdir="$TF_DIR" validate
-      displayName: 'Format and validate Terraform'
+  #         - task: TerraformTaskV4@4
+  #           displayName: Terraform Init
+  #           inputs:
+  #             provider: 'azurerm'
+  #             command: 'init'
+  #             workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+  #             backendServiceArm: 'ServiceConnection-Sp'
+  #             backendAzureRmResourceGroupName: 'rg-tfstate-observability'
+  #             backendAzureRmStorageAccountName: 'stobsstatedev'
+  #             backendAzureRmContainerName: 'tfstate'
+  #             backendAzureRmKey: 'observability-platform.dev.tfstate'
 
-- stage: Plan
-  displayName: 'Terraform plan'
-  dependsOn: Validate
-  condition: succeeded()
-  jobs:
-  - job: CreatePlan
-    displayName: 'Create Terraform plan using Azure OIDC'
-    steps:
-    - checkout: self
+  #         - task: TerraformTaskV4@4
+  #           displayName: Terraform Plan
+  #           inputs:
+  #             provider: 'azurerm'
+  #             command: 'plan'
+  #             workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+  #             commandOptions: '-var-file="../../environments/dev/observability.tfvars" -out=tfplanfile'
+  #             environmentServiceNameAzureRM: 'ServiceConnection-Sp'
 
-    - bash: |
-        set -euo pipefail
-        sudo apt-get update -y
-        sudo apt-get install -y curl unzip
-        VERSION="$(terraformVersion)"
-        mkdir -p "$(Agent.TempDirectory)/terraform-bin"
-        curl -fsSLo "$(Agent.TempDirectory)/terraform.zip" \
-          "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
-        unzip -o "$(Agent.TempDirectory)/terraform.zip" -d "$(Agent.TempDirectory)/terraform-bin"
-        sudo install -m 0755 "$(Agent.TempDirectory)/terraform-bin/terraform" /usr/local/bin/terraform
-        terraform version
-      displayName: 'Install Terraform $(terraformVersion)'
+  #         - task: TerraformTaskV4@4
+  #           displayName: Terraform Apply
+  #           inputs:
+  #             provider: 'azurerm'
+  #             command: 'apply'
+  #             workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+  #             commandOptions: 'tfplanfile'
+  #             # commandOptions: '--auto-approve tfplanfile'
+  #             environmentServiceNameAzureRM: 'ServiceConnection-Sp'
+  - stage: tfdeploy
+    condition: succeeded('tfvalidate')
+    dependsOn: tfvalidate
+    jobs:
+      - job: TerraformPlan
+        displayName: Terraform Plan
+        steps:
+          - task: TerraformTaskV4@4
+            displayName: Terraform Init
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+              backendServiceArm: 'ServiceConnection-Sp'
+              backendAzureRmResourceGroupName: 'rg-tfstate-observability'
+              backendAzureRmStorageAccountName: 'stobsstatedev'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'observability-platform.dev.tfstate'
+          - task: TerraformTaskV4@4
+            displayName: Terraform Plan
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+              commandOptions: '-var-file="../../environments/dev/observability.tfvars" -out=tfplanfile'
+              environmentServiceNameAzureRM: 'ServiceConnection-Sp'
 
-    - task: AzureCLI@2
-      displayName: 'Terraform init and plan'
-      inputs:
-        azureSubscription: '$(azureServiceConnection)'
-        scriptType: bash
-        scriptLocation: inlineScript
-        addSpnToEnvironment: true
-        inlineScript: |
-          set -euo pipefail
-          TF_DIR="$(terraformWorkingDirectory)"
-          ROOT="$(Build.SourcesDirectory)"
+          # Publish the plan file for the apply job
+          - task: PublishPipelineArtifact@1
+            displayName: Publish Terraform Plan
+            inputs:
+              targetPath: '$(System.DefaultWorkingDirectory)/components/observability/tfplanfile'
+              artifact: 'terraform-plan'
 
-          ACTUAL_TENANT="$(az account show --query tenantId --output tsv)"
-          ACTUAL_SUBSCRIPTION="$(az account show --query id --output tsv)"
-          echo "Authenticated tenant: $ACTUAL_TENANT"
-          echo "Authenticated subscription: $ACTUAL_SUBSCRIPTION"
-          if [ "$ACTUAL_TENANT" != "$(tenantId)" ]; then
-            echo "ERROR: Service connection tenant does not match the expected tenant."
-            echo "Expected: $(tenantId) | Actual: $ACTUAL_TENANT"
-            exit 1
-          fi
-          if [ "$ACTUAL_SUBSCRIPTION" != "$(subscriptionId)" ]; then
-            echo "ERROR: Service connection subscription does not match the expected subscription."
-            echo "Expected: $(subscriptionId) | Actual: $ACTUAL_SUBSCRIPTION"
-            exit 1
-          fi
+      # 2. Manual Approval
+      - job: ManualApproval
+        displayName: Wait for Approval
+        dependsOn: TerraformPlan
+        pool: server
+        timeoutInMinutes: 60
+        steps:
+          - task: ManualValidation@1
+            displayName: Approve Terraform Apply
+            timeoutInMinutes: 60
+            inputs:
+              instructions: 'Review and approve the Terraform plan before applying changes.'
+              onTimeout: 'reject'
 
-          if [ ! -d "$TF_DIR" ] || [ ! -f "$TF_DIR/main.tf" ]; then
-            echo "ERROR: Confirmed Terraform root is missing: $TF_DIR"
-            exit 1
-          fi
+      # 3. Terraform Apply (runs only after approval)
+      - job: TerraformApply
+        displayName: Terraform Apply
+        dependsOn: ManualApproval
+        condition: succeeded()
+        steps:
+          - checkout: self
+          - task: DownloadPipelineArtifact@2
+            displayName: Download Terraform Plan
+            inputs:
+              artifact: 'terraform-plan'
+              path: '$(Pipeline.Workspace)/terraform-plan'
 
-          # Prefer the exact environment file; otherwise accept one unique .tfvars file.
-          VAR_FILE="$ROOT/infra/environments/dev/observability.tfvars"
-          if [ ! -f "$VAR_FILE" ]; then
-            VAR_FILE="$ROOT/environments/dev/observability.tfvars"
-          fi
-          if [ ! -f "$VAR_FILE" ]; then
-            mapfile -t VAR_FILES < <(
-              find "$ROOT" -type f -name '*.tfvars' \
-                -not -path '*/.terraform/*' \
-                -not -path '*/.git/*' | sort
-            )
-            if [ "${#VAR_FILES[@]}" -ne 1 ]; then
-              echo "ERROR: Could not identify one tfvars file. Found ${#VAR_FILES[@]}."
-              printf 'tfvars candidate: %s\n' "${VAR_FILES[@]}"
-              exit 1
-            fi
-            VAR_FILE="${VAR_FILES[0]}"
-          fi
+          - task: TerraformTaskV4@4
+            displayName: Terraform Init
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+              backendServiceArm: 'ServiceConnection-Sp'
+              backendAzureRmResourceGroupName: 'rg-tfstate-observability'
+              backendAzureRmStorageAccountName: 'stobsstatedev'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'observability-platform.dev.tfstate'
+          - task: TerraformTaskV4@4
+            displayName: Terraform Apply
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+              commandOptions: '$(Pipeline.Workspace)/terraform-plan/tfplanfile'
+              environmentServiceNameAzureRM: 'ServiceConnection-Sp'
+  - stage: k8s_apply
+    displayName: 'Apply K8s Manifests'
+    condition: succeeded('tfdeploy')
+    dependsOn: tfdeploy
+    jobs:
+      - job: apply_manifests
+        steps:
 
-          echo "Terraform root: $TF_DIR"
-          echo "Variables file: $VAR_FILE"
-
-          # AzureCLI@2 provides these values for a workload identity federation service connection.
-          export ARM_CLIENT_ID="$servicePrincipalId"
-          export ARM_TENANT_ID="$(tenantId)"
-          export ARM_SUBSCRIPTION_ID="$(subscriptionId)"
-          export ARM_USE_OIDC=true
-          export ARM_OIDC_TOKEN="$idToken"
-          export ARM_SKIP_PROVIDER_REGISTRATION=true
-
-          terraform -chdir="$TF_DIR" init -input=false \
-            -backend-config="resource_group_name=$(stateResourceGroup)" \
-            -backend-config="storage_account_name=$(stateStorageAccount)" \
-            -backend-config="container_name=$(stateContainer)" \
-            -backend-config="key=$(stateKey)" \
-            -backend-config="subscription_id=$(subscriptionId)" \
-            -backend-config="tenant_id=$(tenantId)" \
-            -backend-config="use_azuread_auth=true" \
-            -backend-config="use_oidc=true"
-
-          mkdir -p "$(Build.ArtifactStagingDirectory)"
-          terraform -chdir="$TF_DIR" plan -input=false \
-            -var-file="$VAR_FILE" \
-            -out="$(Build.ArtifactStagingDirectory)/tfplan"
-
-    - publish: '$(Build.ArtifactStagingDirectory)/tfplan'
-      artifact: 'terraform-plan'
-      displayName: 'Publish Terraform plan'
-
+          - task: AzureCLI@2
+            displayName: 'Apply namespace + PVC via az aks command invoke'
+            inputs:
+              azureSubscription: 'ServiceConnection-Sp'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az aks command invoke \
+                  --resource-group rg-observability-dev \
+                  --name aks-observability-dev \
+                  --command "kubectl apply -f namespace.yaml -f pvc.yaml -f container-azm-ms-agentconfig.yaml" \
+                  --file $(System.DefaultWorkingDirectory)/components/observability/k8s/namespace.yaml \
+                  --file $(System.DefaultWorkingDirectory)/components/observability/k8s/pvc.yaml \
+                  --file $(System.DefaultWorkingDirectory)/components/observability/k8s/container-azm-ms-agentconfig.yaml
