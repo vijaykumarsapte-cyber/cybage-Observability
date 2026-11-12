@@ -1,244 +1,262 @@
-﻿# Azure Observability Infrastructure Pipeline
+﻿# Azure DevOps pipeline: Terraform + AKS observability deployment
+# Uses Microsoft-hosted Ubuntu agents. No local agent installation is required.
+# IMPORTANT: Review the Terraform plan and approve the manual validation before apply.
 
 trigger: none
 pr: none
-
-name: 'IaC-Observability-POC'
 
 pool:
   vmImage: 'ubuntu-latest'
 
 variables:
+  azureServiceConnection: 'ServiceConnection-Sp'
+  terraformVersion: '1.9.8'
 
-  - name: azureServiceConnection
-    value: 'ServiceConnection-Sp'
+  # Terraform working directory and variables file
+  terraformWorkingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+  terraformVarFile: '$(System.DefaultWorkingDirectory)/environments/dev/observability.tfvars'
 
-  - name: resourceGroup
-    value: 'rg-observability-dev'
+  # Azure Blob remote state
+  stateResourceGroup: 'rg-tfstate-observability'
+  stateStorageAccount: 'stobsstatedev1'
+  stateContainer: 'tfstate'
+  stateKey: 'observability-platform.dev.tfstate'
+  subscriptionId: '47226097-e6c5-43f7-95c7-865d71699fc9'
+  tenantId: 'ea48cb28-034a-4625-85d1-159be074cfab'
 
-  - name: aksCluster
-    value: 'aks-observability-dev'
-
-  - name: terraformWorkingDirectory
-    value: '$(System.DefaultWorkingDirectory)/components/observability'
-
-  - name: terraformVersion
-    value: '1.9.8'
-
-  - name: stateResourceGroup
-    value: 'rg-tfstate-observability'
-
-  - name: stateStorageAccount
-    value: 'stobsstatedev1'
-
-  - name: stateContainer
-    value: 'tfstate'
-
-  - name: stateKey
-    value: 'observability-platform.dev.tfstate'
+  # AKS target
+  aksResourceGroup: 'rg-observability-dev'
+  aksCluster: 'aks-observability-dev'
 
 stages:
-
-# --------------------------------------------------
-# STAGE 1: TERRAFORM VALIDATION
-# --------------------------------------------------
-
-- stage: tfvalidate
-  displayName: 'Terraform Validate'
-
+- stage: Validate
+  displayName: 'Terraform format and validation'
   jobs:
-    - job: Validate
-      displayName: 'Initialize and Validate Terraform'
+  - job: TerraformValidate
+    displayName: 'Install Terraform and validate configuration'
+    steps:
+    - checkout: self
 
-      steps:
-        - checkout: self
+    # Install Terraform directly to avoid dependency on TerraformInstaller@1
+    # or TerraformTaskV4@4 Marketplace extensions.
+    - bash: |
+        set -euo pipefail
+        TERRAFORM_VERSION="$(terraformVersion)"
+        mkdir -p "$(Agent.TempDirectory)/terraform"
+        cd "$(Agent.TempDirectory)/terraform"
+        curl -fsSLo terraform.zip \
+          "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+        unzip -o terraform.zip
+        sudo install -m 0755 terraform /usr/local/bin/terraform
+        echo "Terraform installed:"
+        command -v terraform
+        terraform version
+      displayName: 'Install Terraform $(terraformVersion)'
 
-        - task: TerraformInstaller@1
-          displayName: 'Install Terraform'
-          inputs:
-            terraformVersion: '$(terraformVersion)'
+    - bash: |
+        set -euo pipefail
+        cd "$(terraformWorkingDirectory)"
+        terraform fmt -check -recursive
+        terraform init -backend=false -input=false
+        terraform validate
+      displayName: 'Terraform fmt, init and validate'
 
-        - task: TerraformTaskV4@4
-          displayName: 'Terraform Init'
-          inputs:
-            provider: 'azurerm'
-            command: 'init'
-            workingDirectory: '$(terraformWorkingDirectory)'
-            backendServiceArm: '$(azureServiceConnection)'
-            backendAzureRmResourceGroupName: '$(stateResourceGroup)'
-            backendAzureRmStorageAccountName: '$(stateStorageAccount)'
-            backendAzureRmContainerName: '$(stateContainer)'
-            backendAzureRmKey: '$(stateKey)'
-            backendAzureRmUseEnvironmentVariablesForAuthentication: true
-            backendAzureRmUseEntraIdForAuthentication: true
-
-        - task: TerraformTaskV4@4
-          displayName: 'Terraform Validate'
-          inputs:
-            provider: 'azurerm'
-            command: 'validate'
-            workingDirectory: '$(terraformWorkingDirectory)'
-
-# --------------------------------------------------
-# STAGE 2: TERRAFORM PLAN AND APPLY
-# --------------------------------------------------
-
-- stage: tfdeploy
-  displayName: 'Terraform Plan and Apply'
-  dependsOn: tfvalidate
+- stage: Plan
+  displayName: 'Terraform plan'
+  dependsOn: Validate
   condition: succeeded()
-
   jobs:
-    - job: Plan
-      displayName: 'Terraform Plan'
+  - job: TerraformPlan
+    displayName: 'Initialize remote state and create plan'
+    steps:
+    - checkout: self
 
-      steps:
-        - checkout: self
+    - bash: |
+        set -euo pipefail
+        TERRAFORM_VERSION="$(terraformVersion)"
+        mkdir -p "$(Agent.TempDirectory)/terraform"
+        cd "$(Agent.TempDirectory)/terraform"
+        curl -fsSLo terraform.zip \
+          "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+        unzip -o terraform.zip
+        sudo install -m 0755 terraform /usr/local/bin/terraform
+        terraform version
+      displayName: 'Install Terraform $(terraformVersion)'
 
-        - task: TerraformInstaller@1
-          displayName: 'Install Terraform'
-          inputs:
-            terraformVersion: '$(terraformVersion)'
+    # AzureCLI@2 obtains the federated OIDC token from the service connection.
+    # The ARM_* variables let the Terraform azurerm backend authenticate with OIDC.
+    - task: AzureCLI@2
+      displayName: 'Terraform init and plan (OIDC)'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        addSpnToEnvironment: true
+        inlineScript: |
+          set -euo pipefail
 
-        - task: TerraformTaskV4@4
-          displayName: 'Terraform Init'
-          inputs:
-            provider: 'azurerm'
-            command: 'init'
-            workingDirectory: '$(terraformWorkingDirectory)'
-            backendServiceArm: '$(azureServiceConnection)'
-            backendAzureRmResourceGroupName: '$(stateResourceGroup)'
-            backendAzureRmStorageAccountName: '$(stateStorageAccount)'
-            backendAzureRmContainerName: '$(stateContainer)'
-            backendAzureRmKey: '$(stateKey)'
-            backendAzureRmUseEnvironmentVariablesForAuthentication: true
-            backendAzureRmUseEntraIdForAuthentication: true
+          export ARM_CLIENT_ID="$servicePrincipalId"
+          export ARM_TENANT_ID="$tenantId"
+          export ARM_SUBSCRIPTION_ID="$(subscriptionId)"
+          export ARM_USE_OIDC=true
+          export ARM_OIDC_TOKEN="$idToken"
 
-        - task: TerraformTaskV4@4
-          displayName: 'Terraform Plan'
-          inputs:
-            provider: 'azurerm'
-            command: 'plan'
-            workingDirectory: '$(terraformWorkingDirectory)'
-            commandOptions: '-input=false -lock-timeout=5m -var-file="../../environments/dev/observability.tfvars" -out=tfplanfile'
+          cd "$(terraformWorkingDirectory)"
 
-        - task: PublishPipelineArtifact@1
-          displayName: 'Publish Terraform Plan'
-          inputs:
-            targetPath: '$(terraformWorkingDirectory)/tfplanfile'
-            artifact: 'terraform-plan'
-            publishLocation: 'pipeline'
+          terraform init -input=false \
+            -backend-config="resource_group_name=$(stateResourceGroup)" \
+            -backend-config="storage_account_name=$(stateStorageAccount)" \
+            -backend-config="container_name=$(stateContainer)" \
+            -backend-config="key=$(stateKey)" \
+            -backend-config="subscription_id=$(subscriptionId)" \
+            -backend-config="tenant_id=$(tenantId)" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
 
-    - job: Approval
-      displayName: 'Manual Approval'
-      dependsOn: Plan
-      pool: server
+          terraform plan -input=false \
+            -var-file="$(terraformVarFile)" \
+            -out="$(Build.ArtifactStagingDirectory)/tfplan"
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+    - publish: '$(Build.ArtifactStagingDirectory)/tfplan'
+      artifact: 'terraform-plan'
+      displayName: 'Publish Terraform plan'
+
+- stage: Approval
+  displayName: 'Manual approval before infrastructure changes'
+  dependsOn: Plan
+  condition: succeeded()
+  jobs:
+  - job: WaitForApproval
+    displayName: 'Review and approve Terraform plan'
+    pool: server
+    timeoutInMinutes: 1440
+    steps:
+    - task: ManualValidation@1
       timeoutInMinutes: 1440
+      inputs:
+        notifyUsers: ''
+        instructions: |
+          Review the Terraform plan from the preceding Plan stage.
+          Confirm the subscription, resource group, and planned changes.
+          Approve only if the plan is expected. Reject if it proposes
+          unexpected resource replacement or deletion.
+        onTimeout: 'reject'
 
-      steps:
-        - task: ManualValidation@1
-          displayName: 'Approve Terraform Apply'
-          timeoutInMinutes: 1440
-          inputs:
-            notifyUsers: ''
-            instructions: 'Review the Terraform plan artifact. Approve to continue with Terraform apply.'
-            onTimeout: 'reject'
-
-    - job: Apply
-      displayName: 'Terraform Apply'
-      dependsOn: Approval
-      condition: succeeded()
-
-      steps:
-        - checkout: self
-
-        - task: TerraformInstaller@1
-          displayName: 'Install Terraform'
-          inputs:
-            terraformVersion: '$(terraformVersion)'
-
-        - task: DownloadPipelineArtifact@2
-          displayName: 'Download Terraform Plan'
-          inputs:
-            artifact: 'terraform-plan'
-            path: '$(Pipeline.Workspace)/terraform-plan'
-
-        - task: TerraformTaskV4@4
-          displayName: 'Terraform Init'
-          inputs:
-            provider: 'azurerm'
-            command: 'init'
-            workingDirectory: '$(terraformWorkingDirectory)'
-            backendServiceArm: '$(azureServiceConnection)'
-            backendAzureRmResourceGroupName: '$(stateResourceGroup)'
-            backendAzureRmStorageAccountName: '$(stateStorageAccount)'
-            backendAzureRmContainerName: '$(stateContainer)'
-            backendAzureRmKey: '$(stateKey)'
-            backendAzureRmUseEnvironmentVariablesForAuthentication: true
-            backendAzureRmUseEntraIdForAuthentication: true
-
-        - task: TerraformTaskV4@4
-          displayName: 'Terraform Apply'
-          inputs:
-            provider: 'azurerm'
-            command: 'apply'
-            workingDirectory: '$(terraformWorkingDirectory)'
-            commandOptions: '-input=false -lock-timeout=5m "$(Pipeline.Workspace)/terraform-plan/tfplanfile"'
-
-# --------------------------------------------------
-# STAGE 3: KUBERNETES DEPLOYMENT
-# --------------------------------------------------
-
-- stage: k8s_apply
-  displayName: 'Deploy Observability Kubernetes Manifests'
-  dependsOn: tfdeploy
+- stage: Apply
+  displayName: 'Terraform apply'
+  dependsOn: Approval
   condition: succeeded()
-
   jobs:
-    - job: KubernetesDeploy
-      displayName: 'Apply Kubernetes Manifests'
+  - job: TerraformApply
+    displayName: 'Apply approved Terraform plan'
+    steps:
+    - checkout: self
 
-      steps:
-        - checkout: self
+    - download: current
+      artifact: 'terraform-plan'
+      displayName: 'Download approved Terraform plan'
 
-        - task: AzureCLI@2
-          displayName: 'Deploy Kubernetes Resources'
-          inputs:
-            azureSubscription: '$(azureServiceConnection)'
-            scriptType: 'bash'
-            scriptLocation: 'inlineScript'
-            inlineScript: |
-              set -e
+    - bash: |
+        set -euo pipefail
+        TERRAFORM_VERSION="$(terraformVersion)"
+        mkdir -p "$(Agent.TempDirectory)/terraform"
+        cd "$(Agent.TempDirectory)/terraform"
+        curl -fsSLo terraform.zip \
+          "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+        unzip -o terraform.zip
+        sudo install -m 0755 terraform /usr/local/bin/terraform
+        terraform version
+      displayName: 'Install Terraform $(terraformVersion)'
 
-              echo "Getting AKS credentials..."
+    - task: AzureCLI@2
+      displayName: 'Terraform init and apply approved plan (OIDC)'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        addSpnToEnvironment: true
+        inlineScript: |
+          set -euo pipefail
 
-              az aks get-credentials \
-                --resource-group "$(resourceGroup)" \
-                --name "$(aksCluster)" \
-                --overwrite-existing
+          export ARM_CLIENT_ID="$servicePrincipalId"
+          export ARM_TENANT_ID="$tenantId"
+          export ARM_SUBSCRIPTION_ID="$(subscriptionId)"
+          export ARM_USE_OIDC=true
+          export ARM_OIDC_TOKEN="$idToken"
 
-              echo "Applying Kubernetes namespace..."
+          cd "$(terraformWorkingDirectory)"
 
-              az aks command invoke \
-                --resource-group "$(resourceGroup)" \
-                --name "$(aksCluster)" \
-                --command "kubectl apply -f namespace.yaml" \
-                --file "$(System.DefaultWorkingDirectory)/components/observability/k8s/namespace.yaml"
+          terraform init -input=false \
+            -backend-config="resource_group_name=$(stateResourceGroup)" \
+            -backend-config="storage_account_name=$(stateStorageAccount)" \
+            -backend-config="container_name=$(stateContainer)" \
+            -backend-config="key=$(stateKey)" \
+            -backend-config="subscription_id=$(subscriptionId)" \
+            -backend-config="tenant_id=$(tenantId)" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
 
-              echo "Applying PVC..."
+          terraform apply -input=false -auto-approve \
+            "$(Pipeline.Workspace)/terraform-plan/tfplan"
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
-              az aks command invoke \
-                --resource-group "$(resourceGroup)" \
-                --name "$(aksCluster)" \
-                --command "kubectl apply -f pvc.yaml" \
-                --file "$(System.DefaultWorkingDirectory)/components/observability/k8s/pvc.yaml"
+- stage: DeployKubernetes
+  displayName: 'Deploy observability Kubernetes manifests'
+  dependsOn: Apply
+  condition: succeeded()
+  jobs:
+  - job: DeployManifests
+    displayName: 'Apply Kubernetes YAML files to AKS'
+    steps:
+    - checkout: self
 
-              echo "Applying Azure Monitor agent configuration..."
+    - task: AzureCLI@2
+      displayName: 'Deploy manifests using AKS command invoke'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
 
-              az aks command invoke \
-                --resource-group "$(resourceGroup)" \
-                --name "$(aksCluster)" \
-                --command "kubectl apply -f container-azm-ms-agentconfig.yaml" \
-                --file "$(System.DefaultWorkingDirectory)/components/observability/k8s/container-azm-ms-agentconfig.yaml"
+          K8S_DIR="$(Build.SourcesDirectory)/components/observability/k8s"
 
-              echo "Kubernetes manifest deployment completed."
+          if [ ! -d "$K8S_DIR" ]; then
+            echo "ERROR: Kubernetes manifest directory not found: $K8S_DIR"
+            exit 1
+          fi
+
+          for manifest in namespace.yaml pvc.yaml container-azm-ms-agentconfig.yaml; do
+            if [ ! -f "$K8S_DIR/$manifest" ]; then
+              echo "ERROR: Required manifest not found: $K8S_DIR/$manifest"
+              exit 1
+            fi
+          done
+
+          az aks show \
+            --resource-group "$(aksResourceGroup)" \
+            --name "$(aksCluster)" \
+            --output table
+
+          az aks command invoke \
+            --resource-group "$(aksResourceGroup)" \
+            --name "$(aksCluster)" \
+            --command "kubectl apply -f namespace.yaml" \
+            --file "$K8S_DIR/namespace.yaml"
+
+          az aks command invoke \
+            --resource-group "$(aksResourceGroup)" \
+            --name "$(aksCluster)" \
+            --command "kubectl apply -f pvc.yaml" \
+            --file "$K8S_DIR/pvc.yaml"
+
+          az aks command invoke \
+            --resource-group "$(aksResourceGroup)" \
+            --name "$(aksCluster)" \
+            --command "kubectl apply -f container-azm-ms-agentconfig.yaml" \
+            --file "$K8S_DIR/container-azm-ms-agentconfig.yaml"
+
+          echo "Kubernetes manifests applied successfully."
