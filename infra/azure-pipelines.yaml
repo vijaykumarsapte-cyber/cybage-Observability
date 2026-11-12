@@ -4,7 +4,7 @@ pr: none
 name: 'IaC-Observability-POC'
 
 pool:
-  name: 'LinuxPool'
+  vmImage: 'ubuntu-latest'
 
 # =====================================================
 # PIPELINE VARIABLES
