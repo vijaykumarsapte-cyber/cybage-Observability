@@ -1,10 +1,15 @@
-subscription_id = "e2b40a80-574b-4c80-859c-2003d5b5979b"
+subscription_id = "47226097-e6c5-43f7-95c7-865d71699fc9"
+tenant_id       = "ea48cb28-034a-4625-85d1-159be074cfab"
 location        = "centralindia"
 
 rg_name = "rg-observability-dev"
 
 vnet_name          = "vnet-observability-dev"
 vnet_address_space = "10.60.0.0/23"
+
+# Jump-box VNet peering + AKS private DNS link. rgdevops / vnet-centralindia-1 do not
+# exist in subscription 47226097-..., so this stays off until they do.
+enable_vm_vnet_connectivity = false
 
 rg2_name   = "rgdevops"
 vnet2_name = "vnet-centralindia-1"

@@ -1,5 +1,4 @@
-﻿
-trigger: none
+﻿trigger: none
 pr: none
 
 name: 'IaC-Observability-POC'
@@ -10,6 +9,9 @@ pool:
 # =====================================================
 # PIPELINE VARIABLES
 # =====================================================
+# Repository layout: this file lives at infra/azure-pipelines.yaml and the repo
+# root contains App/ and infra/. $(System.DefaultWorkingDirectory) is the repo
+# root, so every path below is rooted at infra/.
 
 variables:
   - name: terraformVersion
@@ -37,7 +39,16 @@ variables:
     value: 'observability-platform.dev.tfstate'
 
   - name: terraformDirectory
-    value: '$(System.DefaultWorkingDirectory)/components/observability'
+    value: '$(System.DefaultWorkingDirectory)/infra/components/observability'
+
+  - name: varFile
+    value: '$(System.DefaultWorkingDirectory)/infra/environments/dev/observability.tfvars'
+
+  - name: k8sDirectory
+    value: '$(System.DefaultWorkingDirectory)/infra/components/observability/k8s'
+
+  - name: planArtifact
+    value: 'terraform-plan'
 
   - name: workloadResourceGroup
     value: 'rg-observability-dev'
@@ -46,11 +57,11 @@ variables:
     value: 'aks-observability-dev'
 
 
+stages:
+
 # =====================================================
 # STAGE 1 - TERRAFORM VALIDATION
 # =====================================================
-
-stages:
 
 - stage: tfvalidate
   displayName: 'Terraform Validation'
@@ -87,9 +98,17 @@ stages:
         command: 'validate'
         workingDirectory: '$(terraformDirectory)'
 
+    - bash: |
+        set -euo pipefail
+        for f in namespace.yaml pvc.yaml container-azm-ms-agentconfig.yaml; do
+          test -f "$(k8sDirectory)/$f" || { echo "##vso[task.logissue type=error]Missing manifest $f"; exit 1; }
+          python3 -c "import sys, yaml; list(yaml.safe_load_all(open(sys.argv[1]))); print('YAML OK:', sys.argv[1])" "$(k8sDirectory)/$f"
+        done
+      displayName: 'Validate Kubernetes Manifest Syntax'
+
 
 # =====================================================
-# STAGE 2 - TERRAFORM PLAN
+# STAGE 2 - TERRAFORM PLAN, MANUAL APPROVAL, APPLY
 # =====================================================
 
 - stage: tfdeploy
@@ -131,14 +150,30 @@ stages:
         provider: 'azurerm'
         command: 'plan'
         workingDirectory: '$(terraformDirectory)'
-        commandOptions: '-var-file="../../environments/dev/observability.tfvars" -out=tfplanfile'
+        commandOptions: '-input=false -var-file="$(varFile)" -out=tfplanfile'
         environmentServiceNameAzureRM: '$(serviceConnection)'
+
+    # Package the binary plan, the provider lock file it was created with, and a
+    # human-readable copy for reviewers. Apply uses exactly these files.
+    - bash: |
+        set -euo pipefail
+        cd "$(terraformDirectory)"
+        OUT="$(Build.ArtifactStagingDirectory)/$(planArtifact)"
+        mkdir -p "$OUT"
+        terraform show -no-color tfplanfile > "$OUT/tfplan.txt"
+        cp tfplanfile "$OUT/tfplanfile"
+        cp .terraform.lock.hcl "$OUT/.terraform.lock.hcl"
+        echo "===================================="
+        echo "Plan summary"
+        echo "===================================="
+        grep -E '^Plan:|No changes' "$OUT/tfplan.txt" || true
+      displayName: 'Render and Package Terraform Plan'
 
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Terraform Plan'
       inputs:
-        targetPath: '$(terraformDirectory)/tfplanfile'
-        artifact: 'terraform-plan'
+        targetPath: '$(Build.ArtifactStagingDirectory)/$(planArtifact)'
+        artifact: '$(planArtifact)'
 
 
   # JOB 2 - MANUAL APPROVAL
@@ -146,28 +181,32 @@ stages:
   - job: ManualApproval
     displayName: 'Manual Approval'
     dependsOn: TerraformPlan
+    condition: succeeded()
     pool: server
-    timeoutInMinutes: 60
+    timeoutInMinutes: 1440
 
     steps:
 
     - task: ManualValidation@1
       displayName: 'Approve Terraform Apply'
-      timeoutInMinutes: 60
+      timeoutInMinutes: 1440
       inputs:
         instructions: |
-          Review the Terraform Plan.
+          Review the Terraform Plan (job "Terraform Plan" log, or tfplan.txt in the terraform-plan artifact).
           Approve to continue with Terraform Apply.
           Reject to cancel the deployment.
         onTimeout: 'reject'
 
 
-  # JOB 3 - TERRAFORM APPLY
+  # JOB 3 - TERRAFORM APPLY (applies the exact reviewed plan file)
 
   - job: TerraformApply
     displayName: 'Terraform Apply'
-    dependsOn: ManualApproval
+    dependsOn:
+      - TerraformPlan
+      - ManualApproval
     condition: succeeded()
+    timeoutInMinutes: 120
 
     steps:
 
@@ -181,8 +220,16 @@ stages:
     - task: DownloadPipelineArtifact@2
       displayName: 'Download Terraform Plan'
       inputs:
-        artifact: 'terraform-plan'
-        path: '$(Pipeline.Workspace)/terraform-plan'
+        buildType: 'current'
+        artifact: '$(planArtifact)'
+        path: '$(Pipeline.Workspace)/$(planArtifact)'
+
+    # Use the same provider lock file as the plan so init selects identical providers.
+    - bash: |
+        set -euo pipefail
+        cp "$(Pipeline.Workspace)/$(planArtifact)/.terraform.lock.hcl" "$(terraformDirectory)/.terraform.lock.hcl"
+        ls -l "$(Pipeline.Workspace)/$(planArtifact)"
+      displayName: 'Restore Provider Lock File'
 
     - task: TerraformTaskV4@4
       displayName: 'Terraform Init'
@@ -196,19 +243,48 @@ stages:
         backendAzureRmContainerName: '$(stateContainer)'
         backendAzureRmKey: '$(stateKey)'
 
+    # Terraform refuses a stale plan (state changed since plan), so this can only
+    # apply what was reviewed.
     - task: TerraformTaskV4@4
       displayName: 'Terraform Apply'
       inputs:
         provider: 'azurerm'
         command: 'apply'
         workingDirectory: '$(terraformDirectory)'
-        commandOptions: '$(Pipeline.Workspace)/terraform-plan/tfplanfile'
+        commandOptions: '-input=false "$(Pipeline.Workspace)/$(planArtifact)/tfplanfile"'
         environmentServiceNameAzureRM: '$(serviceConnection)'
 
+    - task: AzureCLI@2
+      displayName: 'Verify Azure Resources'
+      inputs:
+        azureSubscription: '$(serviceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -euo pipefail
+          az account set --subscription "$(azureSubscriptionId)"
+          echo "=== Resource group"
+          az group show -n "$(workloadResourceGroup)" --query "{name:name,location:location,state:properties.provisioningState}" -o table
+          echo "=== Resources"
+          az resource list -g "$(workloadResourceGroup)" --query "[].{name:name,type:type}" -o table
+          echo "=== AKS"
+          az aks show -g "$(workloadResourceGroup)" -n "$(aksCluster)" \
+            --query "{state:provisioningState,power:powerState.code,k8s:currentKubernetesVersion,omsAgent:addonProfiles.omsagent.enabled}" -o table
+          az aks nodepool list -g "$(workloadResourceGroup)" --cluster-name "$(aksCluster)" \
+            --query "[].{name:name,count:count,vm:vmSize,state:provisioningState}" -o table
+          echo "=== ACR / Key Vault / Log Analytics"
+          az acr list -g "$(workloadResourceGroup)" --query "[].{name:name,state:provisioningState}" -o table
+          az keyvault list -g "$(workloadResourceGroup)" --query "[].{name:name}" -o table
+          az monitor log-analytics workspace list -g "$(workloadResourceGroup)" --query "[].{name:name,state:provisioningState}" -o table
+          echo "=== Data collection rules"
+          az monitor data-collection rule list -g "$(workloadResourceGroup)" --query "[].{name:name,state:provisioningState}" -o table || true
+
 
 # =====================================================
-# STAGE 3 - KUBERNETES MANIFEST DEPLOYMENT
+# STAGE 3 - KUBERNETES MANIFEST DEPLOYMENT + VERIFICATION
 # =====================================================
+# The cluster is private; the hosted agent has no network path to the API server,
+# so kubectl runs inside the cluster via `az aks command invoke`.
 
 - stage: k8s_apply
   displayName: 'Apply Kubernetes Manifests'
@@ -218,7 +294,8 @@ stages:
   jobs:
 
   - job: apply_manifests
-    displayName: 'Deploy Kubernetes Configuration'
+    displayName: 'Deploy and Verify Kubernetes Configuration'
+    timeoutInMinutes: 60
 
     steps:
 
@@ -230,45 +307,108 @@ stages:
         azureSubscription: '$(serviceConnection)'
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
-
         inlineScript: |
+          set -euo pipefail
 
-          set -e
+          RG="$(workloadResourceGroup)"
+          AKS="$(aksCluster)"
+
+          # az aks command invoke exits 0 even when the in-cluster command fails,
+          # so read exitCode from the JSON result and fail the step ourselves.
+          run_kubectl() {
+            local cmd="$1"; shift
+            echo ">>> $cmd"
+            local out
+            out=$(az aks command invoke -g "$RG" -n "$AKS" --command "$cmd" "$@" -o json)
+            echo "$out" | jq -r '.logs'
+            local rc
+            rc=$(echo "$out" | jq -r '.exitCode')
+            if [ "$rc" != "0" ]; then
+              echo "##vso[task.logissue type=error]Command failed in cluster (exit $rc): $cmd"
+              exit 1
+            fi
+          }
 
           echo "===================================="
           echo "Azure Subscription Verification"
           echo "===================================="
-
           az account set --subscription "$(azureSubscriptionId)"
-          az account show --output table
+          az account show --query "{name:name,id:id,tenant:tenantId}" -o table
 
           echo "===================================="
           echo "Checking AKS Cluster"
           echo "===================================="
-
-          az aks show \
-            --resource-group "$(workloadResourceGroup)" \
-            --name "$(aksCluster)" \
-            --output table
+          az aks show -g "$RG" -n "$AKS" --query "{name:name,state:provisioningState,power:powerState.code}" -o table
+          STATE=$(az aks show -g "$RG" -n "$AKS" --query provisioningState -o tsv)
+          [ "$STATE" = "Succeeded" ] || { echo "##vso[task.logissue type=error]AKS provisioningState=$STATE"; exit 1; }
 
           echo "===================================="
           echo "Applying Kubernetes Manifests"
           echo "===================================="
+          cd "$(k8sDirectory)"
+          for f in namespace.yaml pvc.yaml container-azm-ms-agentconfig.yaml; do
+            test -f "$f" || { echo "##vso[task.logissue type=error]Missing manifest $f"; exit 1; }
+          done
 
-          K8S_DIR="$(System.DefaultWorkingDirectory)/components/observability/k8s"
-
-          test -f "$K8S_DIR/namespace.yaml"
-          test -f "$K8S_DIR/pvc.yaml"
-          test -f "$K8S_DIR/container-azm-ms-agentconfig.yaml"
-
-          az aks command invoke \
-            --resource-group "$(workloadResourceGroup)" \
-            --name "$(aksCluster)" \
-            --command "kubectl apply -f namespace.yaml -f pvc.yaml -f container-azm-ms-agentconfig.yaml" \
-            --file "$K8S_DIR/namespace.yaml" \
-            --file "$K8S_DIR/pvc.yaml" \
-            --file "$K8S_DIR/container-azm-ms-agentconfig.yaml"
+          run_kubectl "kubectl apply -f namespace.yaml -f pvc.yaml -f container-azm-ms-agentconfig.yaml" \
+            --file namespace.yaml \
+            --file pvc.yaml \
+            --file container-azm-ms-agentconfig.yaml
 
           echo "===================================="
           echo "Kubernetes Deployment Completed"
           echo "===================================="
+
+    - task: AzureCLI@2
+      displayName: 'Verify Kubernetes Deployment'
+      inputs:
+        azureSubscription: '$(serviceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -euo pipefail
+
+          RG="$(workloadResourceGroup)"
+          AKS="$(aksCluster)"
+
+          run_kubectl() {
+            local cmd="$1"
+            echo ">>> $cmd"
+            local out
+            out=$(az aks command invoke -g "$RG" -n "$AKS" --command "$cmd" -o json)
+            echo "$out" | jq -r '.logs'
+            local rc
+            rc=$(echo "$out" | jq -r '.exitCode')
+            if [ "$rc" != "0" ]; then
+              echo "##vso[task.logissue type=error]Verification failed (exit $rc): $cmd"
+              exit 1
+            fi
+          }
+
+          az account set --subscription "$(azureSubscriptionId)"
+
+          echo "=== Nodes"
+          run_kubectl "kubectl get nodes -o wide"
+
+          echo "=== Namespace"
+          run_kubectl "kubectl get namespace observability"
+
+          echo "=== StorageClass used by the PVC"
+          run_kubectl "kubectl get storageclass managed-csi-premium"
+
+          # managed-csi-premium uses WaitForFirstConsumer: the PVC stays Pending
+          # until a pod mounts it. Pending or Bound are both healthy here.
+          echo "=== PVC"
+          run_kubectl "kubectl get pvc -n observability observability-data -o wide && kubectl get pvc -n observability observability-data -o jsonpath='{.status.phase}' | grep -E 'Pending|Bound'"
+
+          echo "=== Monitoring agent config"
+          run_kubectl "kubectl get configmap container-azm-ms-agentconfig -n kube-system"
+
+          echo "=== Monitoring agent (Container Insights ama-logs) pods"
+          run_kubectl "kubectl rollout status daemonset/ama-logs -n kube-system --timeout=300s && kubectl get pods -n kube-system -o wide | grep ama-logs"
+
+          echo "=== All pods"
+          run_kubectl "kubectl get pods -A -o wide"
+
+          echo "=== Pods not Running/Completed"
+          run_kubectl "kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded"

@@ -7,16 +7,19 @@ terraform {
     }
   }
 
+  # Existing remote state backend. The pipeline passes the same values via
+  # -backend-config, these are kept identical so local init targets the same state.
   backend "azurerm" {
-    resource_group_name  = "rsg-observability-state-dev"
-    storage_account_name = "stobsstatedev"
-    container_name        = "tfstate"
-    key                   = "observability-platform.dev.tfstate"
+    resource_group_name  = "rg-tfstate-observability"
+    storage_account_name = "stobsstatedev1"
+    container_name       = "tfstate"
+    key                  = "observability-platform.dev.tfstate"
   }
 }
 
 provider "azurerm" {
   features {}
   storage_use_azuread = true
-  subscription_id = var.subscription_id
+  subscription_id     = var.subscription_id
+  tenant_id           = var.tenant_id
 }

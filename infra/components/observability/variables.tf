@@ -3,6 +3,17 @@ variable "subscription_id" {
   type        = string
 }
 
+variable "tenant_id" {
+  description = "Azure AD tenant ID."
+  type        = string
+}
+
+variable "enable_vm_vnet_connectivity" {
+  description = "Create VNet peering and AKS private DNS link to an existing jump-box VNet (rg2_name/vnet2_name). Requires that VNet and the AKS private DNS zone to already exist."
+  type        = bool
+  default     = false
+}
+
 variable "location" {
   description = "Azure region for all resources."
   type        = string
