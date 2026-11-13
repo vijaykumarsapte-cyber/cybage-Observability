@@ -15,7 +15,7 @@ parameters:
     default: 'latest'
 
 pool:
-  name: 'LinuxPool'
+  vmImage: 'ubuntu-latest'
 
 variables:
   terraformVersion: '1.9.8'
