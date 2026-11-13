@@ -156,7 +156,7 @@ stages:
       - job: apply_manifests
         steps:
           - task: AzureCLI@2
-            displayName: 'Apply namespace + PVC (+ Container Insights config)'
+            displayName: 'Apply namespace + PVC + PVC init job (+ Container Insights config)'
             inputs:
               azureSubscription: '$(serviceConnection)'
               scriptType: 'bash'
@@ -169,9 +169,12 @@ stages:
                   az aks command invoke -g "$(resourceGroup)" -n "$(aksCluster)" --command "$cmd" "$@" -o json > invoke.json
                   python3 -c "import json;d=json.load(open('invoke.json'));print(d.get('logs',''));raise SystemExit(d.get('exitCode',1))"
                 }
-                invoke "kubectl apply -f namespace.yaml -f pvc.yaml -f container-azm-ms-agentconfig.yaml" \
+                invoke "kubectl apply -f namespace.yaml -f pvc.yaml -f pvc-init-job.yaml -f container-azm-ms-agentconfig.yaml" \
                   --file "$(k8sDir)/namespace.yaml" \
                   --file "$(k8sDir)/pvc.yaml" \
+                  --file "$(k8sDir)/pvc-init-job.yaml" \
                   --file "$(k8sDir)/container-azm-ms-agentconfig.yaml"
-                # PVC stays Pending until a pod mounts it (WaitForFirstConsumer) - expected.
-                invoke "kubectl get ns observability; kubectl get pvc -n observability"
+                # The storage class binds on first consumer (WaitForFirstConsumer); the
+                # init Job is that consumer, so the disk is created and the PVC becomes Bound.
+                invoke "kubectl wait --for=condition=complete job/observability-data-init -n observability --timeout=300s && kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/observability-data -n observability --timeout=120s"
+                invoke "kubectl get ns observability; kubectl get pvc,pv -n observability -o wide; kubectl get pods -n observability -o wide"

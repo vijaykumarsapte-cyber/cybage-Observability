@@ -1,0 +1,51 @@
+# First consumer for the PVC observability-data.
+# The storage class uses volumeBindingMode WaitForFirstConsumer, so the claim stays
+# Pending (and no disk exists) until a pod mounts it. This one-off Job mounts the
+# claim on the Observability node pool, which makes the CSI driver create the
+# Azure disk and bind the PV. The PVC stays Bound after the Job completes.
+# Re-applying the unchanged Job is a no-op.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: observability-data-init
+  namespace: observability
+  labels:
+    app: observability-data-init
+spec:
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        app: observability-data-init
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector:
+        agentpool: obs
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: observability
+          effect: NoSchedule
+      containers:
+        - name: init
+          image: mcr.microsoft.com/azurelinux/busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              date -u > /data/.initialized
+              echo "observability-data mounted:"; df -h /data; ls -la /data
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: observability-data
