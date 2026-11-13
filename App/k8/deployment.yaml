@@ -1,0 +1,120 @@
+# apiVersion: apps/v1
+# kind: Deployment
+# metadata:
+#   name: demo-api
+# spec:
+#   replicas: 2
+#   selector:
+#     matchLabels:
+#       app: demo-api
+#   template:
+#     metadata:
+#       labels:
+#         app: demo-api
+#     spec:
+#       containers:
+#         - name: demo-api
+#           image: <ACR_NAME>.azurecr.io/demo-api:latest
+#           ports:
+#             - containerPort: 5000
+#           env:
+#             - name: DATABASE_URL
+#               value: postgresql://demo:demo@postgres-service:5432/demo_db
+
+# apiVersion: apps/v1
+# kind: Deployment
+# metadata:
+#   name: demo-api
+#   # namespace: default
+#   # namespace: health-dashboard
+# spec:
+#   replicas: 1
+#   selector:
+#     matchLabels:
+#       app: demo-api
+#   template:
+#     metadata:
+#       labels:
+#         app: demo-api
+#     spec:
+#       containers:
+#         - name: demo-api
+#           # ✅ This will be replaced dynamically by pipeline (recommended)
+#           image: IMAGE_PLACEHOLDER
+#           imagePullPolicy: Always
+
+#           ports:
+#             - containerPort: 5000
+
+#           env:
+#             - name: DATABASE_URL
+#               value: postgresql://demo:demo@postgres-service:5432/demo_db
+
+#           # ✅ Health checks
+#           readinessProbe:
+#             httpGet:
+#               path: /users
+#               port: 5000
+#             initialDelaySeconds: 10
+#             periodSeconds: 5
+
+#           livenessProbe:
+#             httpGet:
+#               path: /users
+#               port: 5000
+#             initialDelaySeconds: 15
+#             periodSeconds: 10
+
+#           # # ✅ Resource limits
+#           # resources:
+#           #   requests:
+#           #     memory: "256Mi"
+#           #     cpu: "250m"
+#           #   limits:
+#           #     memory: "512Mi"
+#           #     cpu: "500m"
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-api
+  namespace: default
+
+spec:
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: demo-api
+
+  template:
+    metadata:
+      labels:
+        app: demo-api
+
+    spec:
+      containers:
+        - name: demo-api
+          image: IMAGE_PLACEHOLDER
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 5000
+
+          env:
+            - name: DATABASE_URL
+              value: postgresql://demo:demo@postgres-service:5432/demo_db
+
+          readinessProbe:
+            httpGet:
+              path: /users
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /users
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 10

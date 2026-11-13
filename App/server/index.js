@@ -1,0 +1,35 @@
+const express = require("express");
+const cors = require("cors");
+const { PrismaClient } = require("@prisma/client");
+
+const app = express();
+const prisma = new PrismaClient();
+
+app.use(cors());
+app.use(express.json());
+
+// Health check
+app.get("/", (req, res) => {
+  res.send("API is running ✅");
+});
+
+// Get users
+app.get("/users", async (req, res) => {
+  const users = await prisma.user.findMany();
+  res.json(users);
+});
+
+// Add user
+app.post("/users", async (req, res) => {
+  const { name } = req.body;
+
+  const user = await prisma.user.create({
+    data: { name },
+  });
+
+  res.json(user);
+});
+
+app.listen(5000, () => {
+  console.log("Server running on http://localhost:5000");
+});
