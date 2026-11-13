@@ -1,14 +1,20 @@
 
 
-trigger:
-  - none
+trigger: none
+
+pool:
+  vmImage: 'ubuntu-latest'
 
 variables:
+  serviceConnection: 'ServiceConnection-Sp'
+  subscriptionId: '47226097-e6c5-43f7-95c7-865d71699fc9'   # azure subscription 1 (tenant ea48cb28-034a-4625-85d1-159be074cfab)
+  location: 'centralindia'
   imageName: demo-api
   acrName: acrobspocdev01
   aksCluster: aks-observability-dev
   resourceGroup: rg-observability-dev
   imageTag: $(Build.BuildId)
+  appDir: '$(System.DefaultWorkingDirectory)/App'   # repo root holds App/ and infra/
 
 stages:
 
@@ -78,8 +84,7 @@ stages:
     - deployment: DeployToAKS
       displayName: Deploy application to AKS
       pool:
-        # vmImage: ubuntu-latest
-        name: LinuxPool
+        vmImage: 'ubuntu-latest'
 
       environment: DEV
 
@@ -618,43 +623,38 @@ stages:
               - task: AzureCLI@2
                 displayName: 'Deploy Observability Stack'
                 inputs:
-                  azureSubscription: 'ServiceConnection-Sp'
+                  azureSubscription: '$(serviceConnection)'
                   scriptType: 'bash'
                   scriptLocation: 'inlineScript'
                   inlineScript: |
-                    set -e
+                    set -euo pipefail
+                    az account set --subscription "$(subscriptionId)"
+
+                    # The AKS API is private: kubectl/helm run inside the cluster via
+                    # `az aks command invoke`. It returns 0 even when the remote command
+                    # fails, so read exitCode from the JSON result and fail on non-zero.
+                    invoke() {
+                      local cmd="$1"; shift
+                      az aks command invoke -g "$(resourceGroup)" -n "$(aksCluster)" \
+                        --command "$cmd" "$@" -o json > invoke.json
+                      python3 -c "import json;d=json.load(open('invoke.json'));print(d.get('logs',''));raise SystemExit(d.get('exitCode',1))"
+                    }
 
                     echo "=================================================="
                     echo "Checking AKS connectivity..."
                     echo "=================================================="
-
-                    az aks command invoke \
-                      --resource-group "$(resourceGroup)" \
-                      --name "$(aksCluster)" \
-                      --command "kubectl get nodes"
-
-                    echo ""
+                    invoke "kubectl get nodes -o wide"
                     echo "AKS connectivity validated successfully."
 
                     echo "=============================================="
                     echo "Deploying Observability Stack to Private AKS"
                     echo "=============================================="
+                    invoke "bash deploy-observability.sh" --file "$(appDir)/deploy-observability.sh"
 
-                    az aks command invoke \
-                      --resource-group rg-observability-dev \
-                      --name aks-observability-dev \
-                      --command "bash deploy-observability.sh" \
-                      --file $(System.DefaultWorkingDirectory)/deploy-observability.sh
-                    
                     echo "=============================================="
                     echo "Deploying tempo and OTEL Stack to Private AKS"
                     echo "=============================================="
-
-                    az aks command invoke \
-                      --resource-group rg-observability-dev \
-                      --name aks-observability-dev \
-                      --command "bash deploy-tempo-otel.sh" \
-                      --file $(System.DefaultWorkingDirectory)/deploy-tempo-otel.sh
+                    invoke "bash deploy-tempo-otel.sh" --file "$(appDir)/deploy-tempo-otel.sh"
 
                     echo "=============================================="
                     echo "Observability Stack deployment completed"
