@@ -1,70 +1,35 @@
-# apiVersion: v1
-# kind: Pod
-# metadata:
-#   name: postgres
-#   labels:
-#     app: postgres
-#   # namespace: default
-# spec:
-#   containers:
-#     - name: postgres
-#       image: postgres:15
-#       env:
-#         - name: POSTGRES_DB
-#           value: demo_db
-#         - name: POSTGRES_USER
-#           value: demo
-#         - name: POSTGRES_PASSWORD
-#           value: demo
-# ---
-# apiVersion: v1
-# kind: Service
-# metadata:
-#   name: postgres-service
-#   # namespace: default
-# spec:
-#   selector:
-#     app: postgres
-#   ports:
-#     - port: 5432
-
-
-#==================
+# Plain Pod (POC only) on the App node; used by demo-api.
 apiVersion: v1
 kind: Pod
 metadata:
   name: postgres
   namespace: default
-
   labels:
     app: postgres
-
 spec:
+  nodeSelector:
+    agentpool: app
   containers:
     - name: postgres
       image: postgres:15
-
+      ports:
+        - containerPort: 5432
       env:
         - name: POSTGRES_DB
           value: demo_db
-
         - name: POSTGRES_USER
           value: demo
-
         - name: POSTGRES_PASSWORD
           value: demo
-
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: postgres-service
   namespace: default
-
 spec:
   selector:
     app: postgres
-
   ports:
     - protocol: TCP
       port: 5432

@@ -13,7 +13,7 @@ pool:
   name: 'LinuxPool'
 
 variables:
-  - group: state-data
+  tfWorkingDir: '$(System.DefaultWorkingDirectory)/infra/components/observability'
 
 stages:
   - stage: tfdestroy_guard
@@ -45,10 +45,10 @@ stages:
             inputs:
               provider: 'azurerm'
               command: 'init'
-              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+              workingDirectory: '$(tfWorkingDir)'
               backendServiceArm: 'ServiceConnection-Sp'
               backendAzureRmResourceGroupName: 'rg-tfstate-observability'
-              backendAzureRmStorageAccountName: 'stobsstatedev'
+              backendAzureRmStorageAccountName: 'stobsstatedev1'
               backendAzureRmContainerName: 'tfstate'
               backendAzureRmKey: 'observability-platform.dev.tfstate'
 
@@ -57,7 +57,7 @@ stages:
             inputs:
               provider: 'azurerm'
               command: 'plan'
-              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+              workingDirectory: '$(tfWorkingDir)'
               commandOptions: '-destroy -var-file="../../environments/dev/observability.tfvars" -out=tfdestroyplan'
               environmentServiceNameAzureRM: 'ServiceConnection-Sp'
 
@@ -66,6 +66,6 @@ stages:
             inputs:
               provider: 'azurerm'
               command: 'apply'
-              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
+              workingDirectory: '$(tfWorkingDir)'
               commandOptions: '--auto-approve tfdestroyplan'
               environmentServiceNameAzureRM: 'ServiceConnection-Sp'

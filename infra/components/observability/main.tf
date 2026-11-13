@@ -25,6 +25,27 @@ locals {
   ]
 }
 
+# Optional: existing build-agent / jump-box VNet (agent_vnet_rg_name/agent_vnet_name).
+# Only looked up when enable_agent_vnet_connectivity = true. It must already exist
+# in this subscription. Needed only if a self-hosted agent must reach the private
+# ACR / Key Vault / AKS API directly (e.g. docker push to the private ACR).
+data "azurerm_virtual_network" "agent" {
+  count               = var.enable_agent_vnet_connectivity ? 1 : 0
+  name                = var.agent_vnet_name
+  resource_group_name = var.agent_vnet_rg_name
+}
+
+locals {
+  # Extra Private DNS zone links: none unless the agent VNet is enabled.
+  dns_additional_vnet_links = var.enable_agent_vnet_connectivity ? {
+    agent = data.azurerm_virtual_network.agent[0].id
+  } : {}
+
+  # AKS private DNS zone = API server private FQDN without its first label,
+  # created by AKS in the node resource group (private_dns_zone_id = "System").
+  aks_private_dns_zone_name = join(".", slice(split(".", module.aks_cluster.private_fqdn), 1, length(split(".", module.aks_cluster.private_fqdn))))
+}
+
 # 1. Resource Group
 module "resource_group" {
   source   = "../../modules/resource_group"
@@ -165,15 +186,16 @@ module "nsg_pe" {
   ]
 }
 
+# Optional: peer the workload VNet with the build-agent VNet.
 module "vnet_peering" {
+  count  = var.enable_agent_vnet_connectivity ? 1 : 0
   source = "../../modules/network/vnet-peering"
 
-  vnet1_name                = var.vnet_name
-  resource1_group_name      = var.rg_name
+  vnet1_name           = module.vnet.virtual_network_name
+  resource1_group_name = module.resource_group.rg
 
-  vnet2_name                = var.vnet2_name
-  resource2_group_name      = var.rg2_name
-
+  vnet2_name           = var.agent_vnet_name
+  resource2_group_name = var.agent_vnet_rg_name
 }
 
 # 4. ACR + Private DNS + Private Link + Private Endpoint
@@ -193,6 +215,7 @@ module "acr_dns_zone" {
   private_dns_zone     = "privatelink.azurecr.io"
   dns_link_name        = local.acr_dns_link_name
   vnet_id              = module.vnet.virtual_network_id
+  additional_vnet_links = local.dns_additional_vnet_links
   location             = var.location
 }
 
@@ -217,6 +240,7 @@ module "kv_dns_zone" {
   private_dns_zone     = "privatelink.vaultcore.azure.net"
   dns_link_name        = local.kv_dns_link_name
   vnet_id              = module.vnet.virtual_network_id
+  additional_vnet_links = local.dns_additional_vnet_links
   location             = var.location
 }
 
@@ -244,6 +268,7 @@ module "storage_dns_zone" {
   private_dns_zone     = "privatelink.blob.core.windows.net"
   dns_link_name        = local.blob_dns_link_name
   vnet_id              = module.vnet.virtual_network_id
+  additional_vnet_links = local.dns_additional_vnet_links
   location             = var.location
 }
 
@@ -304,13 +329,16 @@ module "aks_nodepool_app" {
 
 }
 
+# Optional: link the AKS-managed private DNS zone to the build-agent VNet so the
+# agent can resolve the private API server. Zone name/RG are derived from the cluster.
 module "aks_vm_privatelink" {
-  source          = "../../modules/aks/pvlink"
-  vlinkname  = var.vlinkname
-  aks_private_dns_zone_name  = var.aks_private_dns_zone_name
-  aks_private_dns_zone_rg    = var.aks_private_dns_zone_rg
-  vm_vnet_name      = var.vnet2_name
-  vm_vnet_rg       = var.rg2_name
+  count                     = var.enable_agent_vnet_connectivity ? 1 : 0
+  source                    = "../../modules/aks/pvlink"
+  vlinkname                 = var.vlinkname
+  aks_private_dns_zone_name = local.aks_private_dns_zone_name
+  aks_private_dns_zone_rg   = module.aks_cluster.aks_node_resource_group
+  vm_vnet_name              = var.agent_vnet_name
+  vm_vnet_rg                = var.agent_vnet_rg_name
 }
 
 module "aks_nodepool_observability" {

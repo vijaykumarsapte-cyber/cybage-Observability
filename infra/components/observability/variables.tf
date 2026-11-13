@@ -3,6 +3,11 @@ variable "subscription_id" {
   type        = string
 }
 
+variable "tenant_id" {
+  description = "Microsoft Entra tenant ID."
+  type        = string
+}
+
 variable "location" {
   description = "Azure region for all resources."
   type        = string
@@ -18,31 +23,29 @@ variable "vnet_name" {
   type        = string
 }
 
-variable "rg2_name" {
-  description = "Name of the resource group2."
-  type        = string
+variable "enable_agent_vnet_connectivity" {
+  description = "Peer the workload VNet with an existing build-agent / jump-box VNet and link the private DNS zones (ACR, KV, blob, AKS) to it. The VNet must already exist."
+  type        = bool
+  default     = false
 }
 
-variable "vnet2_name" {
-  description = "Name of the virtual network2."
+variable "agent_vnet_rg_name" {
+  description = "Resource group of the existing build-agent VNet (used only when enable_agent_vnet_connectivity = true)."
   type        = string
+  default     = ""
+}
+
+variable "agent_vnet_name" {
+  description = "Name of the existing build-agent VNet (used only when enable_agent_vnet_connectivity = true)."
+  type        = string
+  default     = ""
 }
 
 variable "vlinkname" {
-  description = "Name of the virtual network link for aks."
+  description = "Name of the AKS private DNS zone link to the build-agent VNet."
   type        = string
+  default     = "aks-private-dns-agent-vnet-link"
 }
-
-variable "aks_private_dns_zone_name" {
-  description = "Name of private dns zone for aks."
-  type        = string
-}
-
-variable "aks_private_dns_zone_rg" {
-  description = "Name of private dns zone rg for aks."
-  type        = string
-}
-
 
 variable "vnet_address_space" {
   description = "Address space for the virtual network."
