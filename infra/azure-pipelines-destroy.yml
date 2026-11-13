@@ -10,7 +10,7 @@ parameters:
     default: ''
 
 pool:
-  name: 'LinuxPool'
+  vmImage: 'ubuntu-latest'
 
 variables:
   tfWorkingDir: '$(System.DefaultWorkingDirectory)/infra/components/observability'
