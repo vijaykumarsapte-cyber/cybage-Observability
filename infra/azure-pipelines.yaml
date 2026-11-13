@@ -2,27 +2,17 @@ trigger: none
 
 name: 'IaC-Observability-POC'
 
-# Optional demo application (doc steps 11-14). Off by default: the image must
-# already be in the private ACR (see App/README or the build notes).
-parameters:
-  - name: deployDemoApp
-    displayName: 'Also deploy demo app (demo-api, postgres, service, AGIC ingress)'
-    type: boolean
-    default: false
-  - name: demoApiImageTag
-    displayName: 'demo-api image tag in ACR (used only when deploying the demo app)'
-    type: string
-    default: 'latest'
+# The demo application (image build + deploy) lives in App/azure-pipeline.yaml.
 
 pool:
   vmImage: 'ubuntu-latest'
+  
 
 variables:
   terraformVersion: '1.9.8'
   serviceConnection: 'ServiceConnection-Sp'
   tfWorkingDir: '$(System.DefaultWorkingDirectory)/infra/components/observability'
   k8sDir: '$(System.DefaultWorkingDirectory)/infra/components/observability/k8s'
-  appK8sDir: '$(System.DefaultWorkingDirectory)/App/k8'
   # Remote state backend (created by hand once - build step 1)
   backendResourceGroup: 'rg-tfstate-observability'
   backendStorageAccount: 'stobsstatedev1'
@@ -31,7 +21,6 @@ variables:
   # Workload
   resourceGroup: 'rg-observability-dev'
   aksCluster: 'aks-observability-dev'
-  acrName: 'acrobspocdev01'
 
 stages:
   - stage: tfvalidate
@@ -186,33 +175,3 @@ stages:
                   --file "$(k8sDir)/container-azm-ms-agentconfig.yaml"
                 # PVC stays Pending until a pod mounts it (WaitForFirstConsumer) - expected.
                 invoke "kubectl get ns observability; kubectl get pvc -n observability"
-
-          - ${{ if eq(parameters.deployDemoApp, true) }}:
-            - task: AzureCLI@2
-              displayName: 'Deploy demo app (demo-api:${{ parameters.demoApiImageTag }})'
-              inputs:
-                azureSubscription: '$(serviceConnection)'
-                scriptType: 'bash'
-                scriptLocation: 'inlineScript'
-                inlineScript: |
-                  set -euo pipefail
-                  invoke() {
-                    local cmd="$1"; shift
-                    az aks command invoke -g "$(resourceGroup)" -n "$(aksCluster)" --command "$cmd" "$@" -o json > invoke.json
-                    python3 -c "import json;d=json.load(open('invoke.json'));print(d.get('logs',''));raise SystemExit(d.get('exitCode',1))"
-                  }
-                  IMAGE="$(acrName).azurecr.io/demo-api:${{ parameters.demoApiImageTag }}"
-                  echo "Checking $IMAGE exists in ACR (management plane)..."
-                  az acr manifest list-metadata -r "$(acrName)" -n demo-api --query "[?tags && contains(tags, '${{ parameters.demoApiImageTag }}')].digest" -o tsv | grep -q . \
-                    || { echo "##vso[task.logissue type=error]Image $IMAGE not found in ACR"; exit 1; }
-
-                  # Substitute the image on the agent (sed is not available inside command invoke).
-                  OUT="$(Agent.TempDirectory)/demo-app"; mkdir -p "$OUT"
-                  cp "$(appK8sDir)/postgres.yaml" "$(appK8sDir)/service.yaml" "$(appK8sDir)/ingress.yaml" "$OUT/"
-                  sed "s|IMAGE_PLACEHOLDER|$IMAGE|" "$(appK8sDir)/deployment.yaml" > "$OUT/deployment.yaml"
-
-                  # Same tag + unchanged manifest = no rollout (avoids needless pod churn).
-                  invoke "kubectl apply -f postgres.yaml -f deployment.yaml -f service.yaml -f ingress.yaml && kubectl rollout status deployment/demo-api -n default --timeout=300s" \
-                    --file "$OUT/postgres.yaml" --file "$OUT/deployment.yaml" \
-                    --file "$OUT/service.yaml" --file "$OUT/ingress.yaml"
-                  invoke "kubectl get pods,svc,endpoints,ingress -n default -o wide"

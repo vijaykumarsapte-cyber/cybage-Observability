@@ -18,67 +18,84 @@ variables:
 
 stages:
 
-# # =========================
-# # ✅ BUILD STAGE
-# # =========================
-# - stage: Build
-#   jobs:
-#     - job: BuildAndPush
-#       pool:
-#         # vmImage: ubuntu-latest
-#         name: LinuxPool 
+# =========================
+# BUILD STAGE - build demo-api and push to the private ACR
+# =========================
+# acrobspocdev01 has public network access Disabled and a hosted agent is outside
+# the VNet, so the push opens the registry ONLY to this agent's public IP
+# (default action Deny) for the few minutes of the push, then restores the
+# original settings (public access Disabled, default action Allow, no IP rules).
+# Restoration runs even if the build fails (trap + always() step).
+- stage: Build
+  jobs:
+    - job: BuildAndPush
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - checkout: self
 
-#       steps:
-#         - checkout: self
+        - task: AzureCLI@2
+          displayName: 'Build and push demo-api (temporary agent-IP access)'
+          inputs:
+            azureSubscription: '$(serviceConnection)'
+            scriptType: 'bash'
+            scriptLocation: 'inlineScript'
+            inlineScript: |
+              set -euo pipefail
+              az account set --subscription "$(subscriptionId)"
+              ACR="$(acrName)"
+              IMAGE="$ACR.azurecr.io/$(imageName):$(imageTag)"
 
-#         - task: AzureCLI@2
-#           displayName: 'Allow pipeline agent IP in ACR'
-#           inputs:
-#             azureSubscription: ServiceConnection-Sp
-#             scriptType: bash
-#             scriptLocation: inlineScript
-#             inlineScript: |
-#               IP=$(curl -s https://api.ipify.org)
+              restore() {
+                echo "Restoring ACR network settings (public access Disabled)..."
+                az acr network-rule remove -n "$ACR" --ip-address "$IP" -o none 2>/dev/null || true
+                az acr update -n "$ACR" --default-action Allow --public-network-enabled false -o none
+                az acr show -n "$ACR" --query "{public:publicNetworkAccess,ipRules:length(networkRuleSet.ipRules)}" -o table
+              }
 
-#               echo "Pipeline agent public IP: $IP"
+              IP=$(curl -fsS https://api.ipify.org)
+              echo "Agent public IP: $IP"
+              trap restore EXIT
 
-#              # az acr network-rule add \
-#              #   --name acrobspocdev \
-#              #   --ip-address "$IP"
+              echo "Opening ACR to this agent IP only (default action Deny)..."
+              az acr update -n "$ACR" --public-network-enabled true --default-action Deny -o none
+              az acr network-rule add -n "$ACR" --ip-address "$IP" -o none
 
+              echo "Building $IMAGE ..."
+              docker build -t "$IMAGE" "$(appDir)/server"
 
-#         # ✅ Build & Push using Azure CLI (NO containerRegistry)
-#         - task: AzureCLI@2
-#           displayName: Build and Push Image to ACR
-#           inputs:
-#             azureSubscription: ServiceConnection-Sp
-#             scriptType: bash
-#             scriptLocation: inlineScript
-#             inlineScript: |
+              # Network rule changes take a short time to apply - retry login/push.
+              for i in $(seq 1 12); do
+                if az acr login -n "$ACR" && docker push "$IMAGE"; then PUSHED=1; break; fi
+                echo "Push not allowed yet (attempt $i/12), waiting 15s..."; sleep 15
+              done
+              [ "${PUSHED:-0}" = 1 ] || { echo "##vso[task.logissue type=error]Push to $ACR failed"; exit 1; }
+              echo "Pushed $IMAGE"
 
-#               IMAGE=$(acrName).azurecr.io/$(imageName):$(imageTag)
-
-#               echo "Login to ACR..."
-#               az acr login --name $(acrName)
-
-#               echo "Build Docker image..."
-#               docker build -t $IMAGE ./server
-
-#               echo "Push image..."
-#               docker push $IMAGE
-
-#               echo "Tag latest..."
-#               docker tag $IMAGE $(acrName).azurecr.io/$(imageName):latest
-#               docker push $(acrName).azurecr.io/$(imageName):latest
-
-
-
+        # Safety net: make sure the registry is private again even if the agent
+        # step was cancelled before its trap ran.
+        - task: AzureCLI@2
+          displayName: 'Ensure ACR public access is Disabled'
+          condition: always()
+          inputs:
+            azureSubscription: '$(serviceConnection)'
+            scriptType: 'bash'
+            scriptLocation: 'inlineScript'
+            inlineScript: |
+              set -euo pipefail
+              az account set --subscription "$(subscriptionId)"
+              for ip in $(az acr network-rule list -n "$(acrName)" --query "ipRules[].ipAddressOrRange" -o tsv); do
+                az acr network-rule remove -n "$(acrName)" --ip-address "${ip%/32}" -o none || true
+              done
+              az acr update -n "$(acrName)" --default-action Allow --public-network-enabled false -o none
+              az acr show -n "$(acrName)" --query "{public:publicNetworkAccess,defaultAction:networkRuleSet.defaultAction,ipRules:length(networkRuleSet.ipRules)}" -o table
 
 # =========================
-# ✅ DEPLOY STAGE
+# DEPLOY STAGE
 # =========================
 - stage: Deploy
-  # dependsOn: Build
+  dependsOn: Build
+  condition: succeeded()
 
   jobs:
     - deployment: DeployToAKS
@@ -615,6 +632,36 @@ stages:
                  # =========================================================
               
               
+              # ==========================================
+              # Demo app (doc steps 11-12): postgres, demo-api, service, AGIC ingress
+              # ==========================================
+              - task: AzureCLI@2
+                displayName: 'Deploy demo app (demo-api:$(imageTag))'
+                inputs:
+                  azureSubscription: '$(serviceConnection)'
+                  scriptType: 'bash'
+                  scriptLocation: 'inlineScript'
+                  inlineScript: |
+                    set -euo pipefail
+                    az account set --subscription "$(subscriptionId)"
+                    invoke() {
+                      local cmd="$1"; shift
+                      az aks command invoke -g "$(resourceGroup)" -n "$(aksCluster)" \
+                        --command "$cmd" "$@" -o json > invoke.json
+                      python3 -c "import json;d=json.load(open('invoke.json'));print(d.get('logs',''));raise SystemExit(d.get('exitCode',1))"
+                    }
+                    IMAGE="$(acrName).azurecr.io/$(imageName):$(imageTag)"
+                    # Substitute the image on the agent (sed is not available inside command invoke).
+                    OUT="$(Agent.TempDirectory)/demo-app"; mkdir -p "$OUT"
+                    cp "$(appDir)/k8/postgres.yaml" "$(appDir)/k8/service.yaml" "$(appDir)/k8/ingress.yaml" "$OUT/"
+                    sed "s|IMAGE_PLACEHOLDER|$IMAGE|" "$(appDir)/k8/deployment.yaml" > "$OUT/deployment.yaml"
+                    grep -n "image:" "$OUT/deployment.yaml"
+
+                    invoke "kubectl apply -f postgres.yaml -f deployment.yaml -f service.yaml -f ingress.yaml && kubectl rollout status deployment/demo-api -n default --timeout=300s" \
+                      --file "$OUT/postgres.yaml" --file "$OUT/deployment.yaml" \
+                      --file "$OUT/service.yaml" --file "$OUT/ingress.yaml"
+                    invoke "kubectl get pods,svc,endpoints,ingress -n default -o wide"
+
               # ==========================================
               # Observability Deployment
               # ==========================================
