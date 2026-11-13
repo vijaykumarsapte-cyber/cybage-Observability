@@ -1,0 +1,23 @@
+# Grafana through the Application Gateway at http://<appgw-ip>/grafana/
+# Grafana runs with root_url .../grafana/ and serve_from_sub_path = true
+# (deploy-observability.sh), so the path is forwarded unchanged.
+# AGIC merges this with demo-ingress ("/") into one path-based rule.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana-ingress
+  namespace: monitoring
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+    appgw.ingress.kubernetes.io/health-probe-path: /api/health
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /grafana
+            pathType: Prefix
+            backend:
+              service:
+                name: monitoring-grafana
+                port:
+                  number: 80

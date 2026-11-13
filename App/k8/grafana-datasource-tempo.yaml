@@ -1,0 +1,28 @@
+# Tempo data source for Grafana (POC doc section 7.4).
+# Picked up by the Grafana datasource sidecar (label grafana_datasource: "1").
+# Prometheus, Alertmanager and Loki come from the kube-prometheus-stack values.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasource-tempo
+  namespace: monitoring
+  labels:
+    grafana_datasource: "1"
+data:
+  tempo-datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Tempo
+        uid: tempo
+        type: tempo
+        access: proxy
+        url: http://tempo.logging.svc.cluster.local:3200
+        isDefault: false
+        editable: true
+        jsonData:
+          tracesToLogsV2:
+            datasourceUid: loki
+          serviceMap:
+            datasourceUid: prometheus
+          nodeGraph:
+            enabled: true

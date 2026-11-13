@@ -660,6 +660,11 @@ stages:
                     invoke "kubectl apply -f postgres.yaml -f deployment.yaml -f service.yaml -f ingress.yaml && kubectl rollout status deployment/demo-api -n default --timeout=300s" \
                       --file "$OUT/postgres.yaml" --file "$OUT/deployment.yaml" \
                       --file "$OUT/service.yaml" --file "$OUT/ingress.yaml"
+
+                    # Demo data for GET /users (John, Jerry). Idempotent; the table is
+                    # created by `prisma db push` when demo-api starts (rollout above).
+                    invoke "kubectl exec -i postgres -n default -- psql -v ON_ERROR_STOP=1 -U demo -d demo_db < seed-users.sql" \
+                      --file "$(appDir)/k8/seed-users.sql"
                     invoke "kubectl get pods,svc,endpoints,ingress -n default -o wide"
 
               # ==========================================
@@ -702,6 +707,13 @@ stages:
                     echo "Deploying tempo and OTEL Stack to Private AKS"
                     echo "=============================================="
                     invoke "bash deploy-tempo-otel.sh" --file "$(appDir)/deploy-tempo-otel.sh"
+
+                    echo "=============================================="
+                    echo "Grafana: Tempo data source + /grafana via Application Gateway"
+                    echo "=============================================="
+                    invoke "kubectl apply -f grafana-datasource-tempo.yaml -f grafana-ingress.yaml && kubectl get ingress -A" \
+                      --file "$(appDir)/k8/grafana-datasource-tempo.yaml" \
+                      --file "$(appDir)/k8/grafana-ingress.yaml"
 
                     echo "=============================================="
                     echo "Observability Stack deployment completed"
