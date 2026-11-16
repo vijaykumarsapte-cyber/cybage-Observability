@@ -1,0 +1,171 @@
+# Login proxy for browser access to Prometheus and Alertmanager.
+#
+#   https://<appgw-ip>/prometheus/    -> monitoring-kube-prometheus-prometheus:9090/
+#   https://<appgw-ip>/alertmanager/  -> monitoring-kube-prometheus-alertmanager:9093/
+#
+# This is a plain nginx reverse proxy behind AGIC (obs-ui-ingress.yaml), not an
+# ingress controller. Neither Prometheus nor Alertmanager has a login of its own,
+# so this proxy adds HTTP basic auth (users in Secret obs-ui-basic-auth, created
+# by obs-ui-apply.sh; hashes only, never committed).
+#
+# - Requests that did not reach the gateway over HTTPS are redirected to HTTPS
+#   before the password is asked for, so credentials never travel over HTTP.
+# - The Prometheus admin API and the /-/reload and /-/quit endpoints are blocked.
+# - /healthz is open for the Application Gateway health probe.
+# - Prometheus/Alertmanager still serve at "/" (routePrefix unchanged) with
+#   externalUrl set to .../prometheus and .../alertmanager, so in-cluster URLs,
+#   Grafana data sources and probes are unaffected.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: obs-auth-proxy-config
+  namespace: monitoring
+  labels:
+    app: obs-auth-proxy
+data:
+  default.conf: |
+    server_tokens off;
+
+    # Application Gateway sends "client-ip:port" in X-Forwarded-For; key the
+    # rate limit on the client IP only.
+    map $http_x_forwarded_for $obs_client_ip {
+      "~^(?<ip>[0-9.]+)" $ip;
+      default            $remote_addr;
+    }
+    limit_req_zone $obs_client_ip zone=obs_ui:1m rate=20r/s;
+
+    server {
+      listen 8080;
+      absolute_redirect off;
+
+      add_header X-Frame-Options "DENY" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header Referrer-Policy "no-referrer" always;
+
+      location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+      }
+
+      location = /prometheus   { return 301 https://$host/prometheus/; }
+      location = /alertmanager { return 301 https://$host/alertmanager/; }
+
+      location /prometheus/ {
+        if ($http_x_forwarded_proto != "https") { return 301 https://$host$request_uri; }
+        limit_req zone=obs_ui burst=100 nodelay;
+        auth_basic           "Observability";
+        auth_basic_user_file /etc/nginx/auth/auth;
+
+        location ~ ^/prometheus/(api/v1/admin/|-/(reload|quit)) { return 403; }
+
+        proxy_set_header Authorization "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 120s;
+        proxy_pass http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090/;
+      }
+
+      location /alertmanager/ {
+        if ($http_x_forwarded_proto != "https") { return 301 https://$host$request_uri; }
+        limit_req zone=obs_ui burst=100 nodelay;
+        auth_basic           "Observability";
+        auth_basic_user_file /etc/nginx/auth/auth;
+
+        location ~ ^/alertmanager/-/(reload|quit) { return 403; }
+
+        proxy_set_header Authorization "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_pass http://monitoring-kube-prometheus-alertmanager.monitoring.svc.cluster.local:9093/;
+      }
+
+      location / { return 404; }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: obs-auth-proxy
+  namespace: monitoring
+  labels:
+    app: obs-auth-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: obs-auth-proxy
+  template:
+    metadata:
+      labels:
+        app: obs-auth-proxy
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: nginx
+          image: nginxinc/nginx-unprivileged:1.27.3
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+            - name: auth
+              mountPath: /etc/nginx/auth
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: obs-auth-proxy-config
+        - name: auth
+          secret:
+            secretName: obs-ui-basic-auth
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: obs-auth-proxy
+  namespace: monitoring
+  labels:
+    app: obs-auth-proxy
+spec:
+  type: ClusterIP
+  selector:
+    app: obs-auth-proxy
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

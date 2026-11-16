@@ -674,6 +674,8 @@ stages:
                            
               - task: AzureCLI@2
                 displayName: 'Deploy Observability Stack'
+                env:
+                  OBS_UI_PASSWORD: $(OBS_UI_PASSWORD)
                 inputs:
                   azureSubscription: '$(serviceConnection)'
                   scriptType: 'bash'
@@ -714,6 +716,23 @@ stages:
                     invoke "kubectl apply -f grafana-datasource-tempo.yaml -f grafana-ingress.yaml && kubectl get ingress -A" \
                       --file "$(appDir)/k8/grafana-datasource-tempo.yaml" \
                       --file "$(appDir)/k8/grafana-ingress.yaml"
+
+                    echo "=============================================="
+                    echo "Prometheus + Alertmanager: HTTPS /prometheus, /alertmanager (basic auth)"
+                    echo "=============================================="
+                    files=(--file "$(appDir)/k8/obs-ui-apply.sh"
+                           --file "$(appDir)/k8/obs-auth-proxy.yaml"
+                           --file "$(appDir)/k8/obs-ui-ingress.yaml")
+                    # Secret variable OBS_UI_PASSWORD (optional): when set, the basic-auth
+                    # user obs-admin gets this password. Only the hash is sent to the
+                    # cluster. When unset, the existing secret is kept.
+                    case "${OBS_UI_PASSWORD:-}" in
+                      ''|'$('*) echo "OBS_UI_PASSWORD not set - keeping existing basic-auth secret" ;;
+                      *) printf 'obs-admin:%s\n' "$(printf '%s' "$OBS_UI_PASSWORD" | openssl passwd -6 -stdin)" > htpasswd
+                         files+=(--file htpasswd) ;;
+                    esac
+                    invoke "bash obs-ui-apply.sh" "${files[@]}"
+                    rm -f htpasswd
 
                     echo "=============================================="
                     echo "Observability Stack deployment completed"
