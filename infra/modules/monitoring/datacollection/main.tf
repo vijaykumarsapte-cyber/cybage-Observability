@@ -5,12 +5,22 @@ resource "azurerm_monitor_data_collection_endpoint" "dce" {
   tags                = var.common_tags
 }
 
+# A brand-new DCE is not immediately usable: creating the DCR right after it
+# fails with "InvalidPayload: Data collection rule is invalid" (400). Wait for
+# the DCE to propagate. Only delays the run in which the DCE is created.
+resource "time_sleep" "wait_for_dce" {
+  create_duration = "90s"
+  triggers = {
+    dce_id = azurerm_monitor_data_collection_endpoint.dce.id
+  }
+}
+
 resource "azurerm_monitor_data_collection_rule" "dcr" {
   name                        = var.dcr_name
   resource_group_name         = var.resource_group_name
   location                    = var.location
   kind                        = "Linux"
-  data_collection_endpoint_id = azurerm_monitor_data_collection_endpoint.dce.id
+  data_collection_endpoint_id = time_sleep.wait_for_dce.triggers["dce_id"]
   tags                        = var.common_tags
 
   dynamic "data_flow" {
@@ -68,7 +78,8 @@ resource "azurerm_monitor_data_collection_rule" "dcr" {
   }
 
   depends_on = [
-    azurerm_monitor_data_collection_endpoint.dce
+    azurerm_monitor_data_collection_endpoint.dce,
+    time_sleep.wait_for_dce
   ]
 }
 

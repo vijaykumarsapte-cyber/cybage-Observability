@@ -1,120 +1,39 @@
-# apiVersion: apps/v1
-# kind: Deployment
-# metadata:
-#   name: demo-api
-# spec:
-#   replicas: 2
-#   selector:
-#     matchLabels:
-#       app: demo-api
-#   template:
-#     metadata:
-#       labels:
-#         app: demo-api
-#     spec:
-#       containers:
-#         - name: demo-api
-#           image: <ACR_NAME>.azurecr.io/demo-api:latest
-#           ports:
-#             - containerPort: 5000
-#           env:
-#             - name: DATABASE_URL
-#               value: postgresql://demo:demo@postgres-service:5432/demo_db
-
-# apiVersion: apps/v1
-# kind: Deployment
-# metadata:
-#   name: demo-api
-#   # namespace: default
-#   # namespace: health-dashboard
-# spec:
-#   replicas: 1
-#   selector:
-#     matchLabels:
-#       app: demo-api
-#   template:
-#     metadata:
-#       labels:
-#         app: demo-api
-#     spec:
-#       containers:
-#         - name: demo-api
-#           # ✅ This will be replaced dynamically by pipeline (recommended)
-#           image: IMAGE_PLACEHOLDER
-#           imagePullPolicy: Always
-
-#           ports:
-#             - containerPort: 5000
-
-#           env:
-#             - name: DATABASE_URL
-#               value: postgresql://demo:demo@postgres-service:5432/demo_db
-
-#           # ✅ Health checks
-#           readinessProbe:
-#             httpGet:
-#               path: /users
-#               port: 5000
-#             initialDelaySeconds: 10
-#             periodSeconds: 5
-
-#           livenessProbe:
-#             httpGet:
-#               path: /users
-#               port: 5000
-#             initialDelaySeconds: 15
-#             periodSeconds: 10
-
-#           # # ✅ Resource limits
-#           # resources:
-#           #   requests:
-#           #     memory: "256Mi"
-#           #     cpu: "250m"
-#           #   limits:
-#           #     memory: "512Mi"
-#           #     cpu: "500m"
-
+# demo-api - zero-downtime rollout behind the Application Gateway (doc step 12).
+# IMAGE_PLACEHOLDER is replaced by the pipeline with <acr>.azurecr.io/demo-api:<tag>.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: demo-api
   namespace: default
-
 spec:
-  replicas: 1
-
+  replicas: 2                  # a second pod keeps serving while one is replaced
   selector:
     matchLabels:
       app: demo-api
-
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0        # never drop below 2 ready pods
+      maxSurge: 1              # add the new pod first, remove an old one once ready
   template:
     metadata:
       labels:
         app: demo-api
-
     spec:
+      nodeSelector:
+        agentpool: app         # App node pool, not the system node
       containers:
         - name: demo-api
           image: IMAGE_PLACEHOLDER
-          imagePullPolicy: Always
-
+          imagePullPolicy: Always   # same tag is re-pulled on restart (kubelet identity has AcrPull)
           ports:
             - containerPort: 5000
-
           env:
             - name: DATABASE_URL
               value: postgresql://demo:demo@postgres-service:5432/demo_db
-
           readinessProbe:
             httpGet:
               path: /users
               port: 5000
-            initialDelaySeconds: 10
+            initialDelaySeconds: 5
             periodSeconds: 5
-
-          livenessProbe:
-            httpGet:
-              path: /users
-              port: 5000
-            initialDelaySeconds: 15
-            periodSeconds: 10

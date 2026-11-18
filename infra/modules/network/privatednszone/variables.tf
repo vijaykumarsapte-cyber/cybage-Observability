@@ -24,14 +24,8 @@ variable "vnet_id" {
   type        = string
 }
 
-variable "resource2_group_name" {
-  description = "Name of the resource2 group"
-  type        = string
-  default     = "rgdevops"
-}
-
-variable "vnet2_name" {
-  description = "Name of the Virtual Network two"
-  type        = string
-  default     = "vnet-centralindia-1"
+variable "additional_vnet_links" {
+  description = "Extra VNets to link to the zone, as { <link suffix> = <VNet resource ID> }. Empty by default."
+  type        = map(string)
+  default     = {}
 }

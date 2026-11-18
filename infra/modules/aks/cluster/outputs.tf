@@ -48,3 +48,8 @@ output "kv_secrets_provider_object_id" {
   description = "Object ID of the Key Vault secrets provider add-on identity"
   value       = try(azurerm_kubernetes_cluster.aks.key_vault_secrets_provider[0].secret_identity[0].object_id, null)
 }
+
+output "private_fqdn" {
+  description = "Private FQDN of the API server (private clusters only)"
+  value       = azurerm_kubernetes_cluster.aks.private_fqdn
+}

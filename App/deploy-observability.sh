@@ -29,6 +29,14 @@ MONITORING_RELEASE="monitoring"
 LOKI_RELEASE="loki"
 ALLOY_RELEASE="alloy"
 
+# Browser URL of the Application Gateway. Prometheus and Alertmanager are served
+# at ${OBS_PUBLIC_URL}/prometheus and /alertmanager through obs-auth-proxy
+# (k8/obs-auth-proxy.yaml, k8/obs-ui-ingress.yaml). The IP is read from the
+# application ingress; the fallback is the gateway IP at the time of writing.
+APPGW_IP=$(kubectl get ingress demo-ingress -n default \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+OBS_PUBLIC_URL="https://${APPGW_IP:-20.204.148.12}"
+
 # ============================================================
 # Grafana Credentials
 # Hardcoded as requested
@@ -373,7 +381,9 @@ prometheus:
 
     podMonitorSelectorNilUsesHelmValues: false
 
-    externalUrl: ""
+    # UI links use the browser path; Prometheus itself still serves at "/"
+    # (routePrefix), so in-cluster URLs and Grafana data sources are unchanged.
+    externalUrl: "${OBS_PUBLIC_URL}/prometheus"
 
     routePrefix: /
 
@@ -392,6 +402,10 @@ alertmanager:
   alertmanagerSpec:
 
     resources: {}
+
+    externalUrl: "${OBS_PUBLIC_URL}/alertmanager"
+
+    routePrefix: /
 
 # ============================================================
 # Node Exporter

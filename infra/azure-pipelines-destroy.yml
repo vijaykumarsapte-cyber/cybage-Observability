@@ -3,6 +3,15 @@ pr: none
 
 name: 'IaC-Observability-POC-DESTROY'
 
+# Destroys everything in the Terraform state below (rg-observability-dev and
+# its resources). The state storage account itself is NOT destroyed.
+#
+# Safety:
+#   1. Guard  - the run parameter must equal the resource group name.
+#   2. Plan   - "terraform plan -destroy"; the log lists every resource to delete.
+#   3. Approve - manual approval after reading the plan (60 min, else rejected).
+#   4. Apply  - applies exactly the reviewed plan file.
+
 parameters:
   - name: confirmResourceGroup
     displayName: 'Type the exact resource group name to confirm destroy (rg-observability-dev)'
@@ -10,62 +19,137 @@ parameters:
     default: ''
 
 pool:
-  name: 'LinuxPool'
+  vmImage: 'ubuntu-latest'
 
 variables:
-  - group: state-data
+  terraformVersion: '1.9.8'
+  serviceConnection: 'ServiceConnection-Sp'
+  tfWorkingDir: '$(System.DefaultWorkingDirectory)/infra/components/observability'
+  tfVarFile: '../../environments/dev/observability.tfvars'
+  # Remote state backend (same as azure-pipelines.yaml)
+  backendResourceGroup: 'rg-tfstate-observability'
+  backendStorageAccount: 'stobsstatedev1'
+  backendContainer: 'tfstate'
+  backendKey: 'observability-platform.dev.tfstate'
+  # Resource group the confirmation must match
+  targetResourceGroup: 'rg-observability-dev'
 
 stages:
+  # 1. Guard - typed confirmation must match the resource group name
   - stage: tfdestroy_guard
+    displayName: 'Confirm destroy'
     jobs:
       - job: guard
         steps:
+          - checkout: none
           - bash: |
-              if [ "${{ parameters.confirmResourceGroup }}" != "rg-observability-dev" ]; then
-                echo "##vso[task.logissue type=error]Confirmation did not match 'rg-observability-dev'. Aborting destroy."
+              set -euo pipefail
+              # Trim surrounding whitespace and quotes; the comparison itself is exact.
+              typed=$(printf '%s' "$CONFIRM" | sed -e 's/^[[:space:]"'\'']*//' -e 's/[[:space:]"'\'']*$//')
+              if [ "$typed" != "$TARGET_RG" ]; then
+                echo "##vso[task.logissue type=error]Confirmation '$typed' did not match '$TARGET_RG'. Aborting destroy."
+                echo "Re-run the pipeline and type exactly: $TARGET_RG"
                 exit 1
               fi
-              echo "Confirmation matched. Proceeding to destroy."
+              echo "Confirmation matched '$TARGET_RG'. Continuing to destroy plan."
             displayName: 'Verify destroy confirmation'
+            env:
+              # Passed as an environment variable, not pasted into the script.
+              CONFIRM: ${{ parameters.confirmResourceGroup }}
+              TARGET_RG: $(targetResourceGroup)
 
   - stage: tfdestroy
+    displayName: 'Terraform destroy'
     condition: succeeded('tfdestroy_guard')
     dependsOn: tfdestroy_guard
     jobs:
-      - job: destroy
+      # 2. Destroy plan
+      - job: DestroyPlan
+        displayName: Terraform Plan (destroy)
         steps:
-
           - task: TerraformInstaller@1
             displayName: Install Terraform
             inputs:
-              terraformVersion: '1.9.8'
+              terraformVersion: '$(terraformVersion)'
 
           - task: TerraformTaskV4@4
             displayName: Terraform Init
             inputs:
               provider: 'azurerm'
               command: 'init'
-              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
-              backendServiceArm: 'ServiceConnection-Sp'
-              backendAzureRmResourceGroupName: 'rg-tfstate-observability'
-              backendAzureRmStorageAccountName: 'stobsstatedev'
-              backendAzureRmContainerName: 'tfstate'
-              backendAzureRmKey: 'observability-platform.dev.tfstate'
+              workingDirectory: '$(tfWorkingDir)'
+              backendServiceArm: '$(serviceConnection)'
+              backendAzureRmResourceGroupName: '$(backendResourceGroup)'
+              backendAzureRmStorageAccountName: '$(backendStorageAccount)'
+              backendAzureRmContainerName: '$(backendContainer)'
+              backendAzureRmKey: '$(backendKey)'
 
           - task: TerraformTaskV4@4
             displayName: Terraform Plan (destroy)
             inputs:
               provider: 'azurerm'
               command: 'plan'
-              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
-              commandOptions: '-destroy -var-file="../../environments/dev/observability.tfvars" -out=tfdestroyplan'
-              environmentServiceNameAzureRM: 'ServiceConnection-Sp'
+              workingDirectory: '$(tfWorkingDir)'
+              commandOptions: '-destroy -var-file="$(tfVarFile)" -out=tfdestroyplan'
+              environmentServiceNameAzureRM: '$(serviceConnection)'
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish destroy plan
+            inputs:
+              targetPath: '$(tfWorkingDir)/tfdestroyplan'
+              artifact: 'terraform-destroy-plan'
+
+      # 3. Manual approval - read the destroy plan first
+      - job: ManualApproval
+        displayName: Wait for destroy approval
+        dependsOn: DestroyPlan
+        condition: succeeded()
+        pool: server
+        timeoutInMinutes: 60
+        steps:
+          - task: ManualValidation@1
+            displayName: Approve Terraform Destroy
+            timeoutInMinutes: 60
+            inputs:
+              instructions: 'DESTROY: open the "Terraform Plan (destroy)" job log and check the list of resources to be destroyed in rg-observability-dev. Approve only if everything listed should be deleted. This cannot be undone.'
+              onTimeout: 'reject'
+
+      # 4. Apply the reviewed destroy plan
+      - job: DestroyApply
+        displayName: Terraform Apply (destroy)
+        dependsOn: ManualApproval
+        condition: succeeded()
+        steps:
+          - checkout: self
+
+          - task: DownloadPipelineArtifact@2
+            displayName: Download destroy plan
+            inputs:
+              artifact: 'terraform-destroy-plan'
+              path: '$(Pipeline.Workspace)/terraform-destroy-plan'
+
+          - task: TerraformInstaller@1
+            displayName: Install Terraform
+            inputs:
+              terraformVersion: '$(terraformVersion)'
+
+          - task: TerraformTaskV4@4
+            displayName: Terraform Init
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(tfWorkingDir)'
+              backendServiceArm: '$(serviceConnection)'
+              backendAzureRmResourceGroupName: '$(backendResourceGroup)'
+              backendAzureRmStorageAccountName: '$(backendStorageAccount)'
+              backendAzureRmContainerName: '$(backendContainer)'
+              backendAzureRmKey: '$(backendKey)'
 
           - task: TerraformTaskV4@4
             displayName: Terraform Apply (destroy)
             inputs:
               provider: 'azurerm'
               command: 'apply'
-              workingDirectory: '$(System.DefaultWorkingDirectory)/components/observability'
-              commandOptions: '--auto-approve tfdestroyplan'
-              environmentServiceNameAzureRM: 'ServiceConnection-Sp'
+              workingDirectory: '$(tfWorkingDir)'
+              commandOptions: '$(Pipeline.Workspace)/terraform-destroy-plan/tfdestroyplan'
+              environmentServiceNameAzureRM: '$(serviceConnection)'

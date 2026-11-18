@@ -1,0 +1,35 @@
+# Prometheus and Alertmanager through the Application Gateway, over HTTPS:
+#   https://<appgw-ip>/prometheus/  and  https://<appgw-ip>/alertmanager/
+# Both paths go to obs-auth-proxy (basic auth), never straight to the services.
+# The TLS secret obs-ui-tls is a self-signed certificate for the gateway IP,
+# created by obs-ui-apply.sh. AGIC adds a 443 listener for these paths; the
+# existing port-80 routes (demo-ingress "/", grafana-ingress "/grafana") are
+# unchanged. Loki and Tempo are deliberately not exposed (Grafana Explore only).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: obs-ui-ingress
+  namespace: monitoring
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+    appgw.ingress.kubernetes.io/health-probe-path: /healthz
+spec:
+  tls:
+    - secretName: obs-ui-tls
+  rules:
+    - http:
+        paths:
+          - path: /prometheus
+            pathType: Prefix
+            backend:
+              service:
+                name: obs-auth-proxy
+                port:
+                  number: 80
+          - path: /alertmanager
+            pathType: Prefix
+            backend:
+              service:
+                name: obs-auth-proxy
+                port:
+                  number: 80

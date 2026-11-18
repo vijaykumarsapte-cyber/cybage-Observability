@@ -1,85 +1,107 @@
 
 
-trigger:
-  - none
+trigger: none
+
+pool:
+  vmImage: 'ubuntu-latest'
 
 variables:
+  serviceConnection: 'ServiceConnection-Sp'
+  subscriptionId: '47226097-e6c5-43f7-95c7-865d71699fc9'   # azure subscription 1 (tenant ea48cb28-034a-4625-85d1-159be074cfab)
+  location: 'centralindia'
   imageName: demo-api
-  acrName: acrobspocdev
+  acrName: acrobspocdev01
   aksCluster: aks-observability-dev
   resourceGroup: rg-observability-dev
   imageTag: $(Build.BuildId)
+  appDir: '$(System.DefaultWorkingDirectory)/App'   # repo root holds App/ and infra/
 
 stages:
 
-# # =========================
-# # ✅ BUILD STAGE
-# # =========================
-# - stage: Build
-#   jobs:
-#     - job: BuildAndPush
-#       pool:
-#         # vmImage: ubuntu-latest
-#         name: LinuxPool 
+# =========================
+# BUILD STAGE - build demo-api and push to the private ACR
+# =========================
+# acrobspocdev01 has public network access Disabled and a hosted agent is outside
+# the VNet, so the push opens the registry ONLY to this agent's public IP
+# (default action Deny) for the few minutes of the push, then restores the
+# original settings (public access Disabled, default action Allow, no IP rules).
+# Restoration runs even if the build fails (trap + always() step).
+- stage: Build
+  jobs:
+    - job: BuildAndPush
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - checkout: self
 
-#       steps:
-#         - checkout: self
+        - task: AzureCLI@2
+          displayName: 'Build and push demo-api (temporary agent-IP access)'
+          inputs:
+            azureSubscription: '$(serviceConnection)'
+            scriptType: 'bash'
+            scriptLocation: 'inlineScript'
+            inlineScript: |
+              set -euo pipefail
+              az account set --subscription "$(subscriptionId)"
+              ACR="$(acrName)"
+              IMAGE="$ACR.azurecr.io/$(imageName):$(imageTag)"
 
-#         - task: AzureCLI@2
-#           displayName: 'Allow pipeline agent IP in ACR'
-#           inputs:
-#             azureSubscription: ServiceConnection-Sp
-#             scriptType: bash
-#             scriptLocation: inlineScript
-#             inlineScript: |
-#               IP=$(curl -s https://api.ipify.org)
+              restore() {
+                echo "Restoring ACR network settings (public access Disabled)..."
+                az acr network-rule remove -n "$ACR" --ip-address "$IP" -o none 2>/dev/null || true
+                az acr update -n "$ACR" --default-action Allow --public-network-enabled false -o none
+                az acr show -n "$ACR" --query "{public:publicNetworkAccess,ipRules:length(networkRuleSet.ipRules)}" -o table
+              }
 
-#               echo "Pipeline agent public IP: $IP"
+              IP=$(curl -fsS https://api.ipify.org)
+              echo "Agent public IP: $IP"
+              trap restore EXIT
 
-#              # az acr network-rule add \
-#              #   --name acrobspocdev \
-#              #   --ip-address "$IP"
+              echo "Opening ACR to this agent IP only (default action Deny)..."
+              az acr update -n "$ACR" --public-network-enabled true --default-action Deny -o none
+              az acr network-rule add -n "$ACR" --ip-address "$IP" -o none
 
+              echo "Building $IMAGE ..."
+              docker build -t "$IMAGE" "$(appDir)/server"
 
-#         # ✅ Build & Push using Azure CLI (NO containerRegistry)
-#         - task: AzureCLI@2
-#           displayName: Build and Push Image to ACR
-#           inputs:
-#             azureSubscription: ServiceConnection-Sp
-#             scriptType: bash
-#             scriptLocation: inlineScript
-#             inlineScript: |
+              # Network rule changes take a short time to apply - retry login/push.
+              for i in $(seq 1 12); do
+                if az acr login -n "$ACR" && docker push "$IMAGE"; then PUSHED=1; break; fi
+                echo "Push not allowed yet (attempt $i/12), waiting 15s..."; sleep 15
+              done
+              [ "${PUSHED:-0}" = 1 ] || { echo "##vso[task.logissue type=error]Push to $ACR failed"; exit 1; }
+              echo "Pushed $IMAGE"
 
-#               IMAGE=$(acrName).azurecr.io/$(imageName):$(imageTag)
-
-#               echo "Login to ACR..."
-#               az acr login --name $(acrName)
-
-#               echo "Build Docker image..."
-#               docker build -t $IMAGE ./server
-
-#               echo "Push image..."
-#               docker push $IMAGE
-
-#               echo "Tag latest..."
-#               docker tag $IMAGE $(acrName).azurecr.io/$(imageName):latest
-#               docker push $(acrName).azurecr.io/$(imageName):latest
-
-
-
+        # Safety net: make sure the registry is private again even if the agent
+        # step was cancelled before its trap ran.
+        - task: AzureCLI@2
+          displayName: 'Ensure ACR public access is Disabled'
+          condition: always()
+          inputs:
+            azureSubscription: '$(serviceConnection)'
+            scriptType: 'bash'
+            scriptLocation: 'inlineScript'
+            inlineScript: |
+              set -euo pipefail
+              az account set --subscription "$(subscriptionId)"
+              for ip in $(az acr network-rule list -n "$(acrName)" --query "ipRules[].ipAddressOrRange" -o tsv); do
+                az acr network-rule remove -n "$(acrName)" --ip-address "${ip%/32}" -o none || true
+              done
+              az acr update -n "$(acrName)" --default-action Allow --public-network-enabled false -o none
+              az acr show -n "$(acrName)" --query "{public:publicNetworkAccess,defaultAction:networkRuleSet.defaultAction,ipRules:length(networkRuleSet.ipRules)}" -o table
 
 # =========================
-# ✅ DEPLOY STAGE
+# DEPLOY STAGE
 # =========================
 - stage: Deploy
-  # dependsOn: Build
+  dependsOn: Build
+  condition: succeeded()
 
   jobs:
     - deployment: DeployToAKS
       displayName: Deploy application to AKS
       pool:
-        # vmImage: ubuntu-latest
-        name: LinuxPool
+        vmImage: 'ubuntu-latest'
 
       environment: DEV
 
@@ -611,50 +633,106 @@ stages:
               
               
               # ==========================================
+              # Demo app (doc steps 11-12): postgres, demo-api, service, AGIC ingress
+              # ==========================================
+              - task: AzureCLI@2
+                displayName: 'Deploy demo app (demo-api:$(imageTag))'
+                inputs:
+                  azureSubscription: '$(serviceConnection)'
+                  scriptType: 'bash'
+                  scriptLocation: 'inlineScript'
+                  inlineScript: |
+                    set -euo pipefail
+                    az account set --subscription "$(subscriptionId)"
+                    invoke() {
+                      local cmd="$1"; shift
+                      az aks command invoke -g "$(resourceGroup)" -n "$(aksCluster)" \
+                        --command "$cmd" "$@" -o json > invoke.json
+                      python3 -c "import json;d=json.load(open('invoke.json'));print(d.get('logs',''));raise SystemExit(d.get('exitCode',1))"
+                    }
+                    IMAGE="$(acrName).azurecr.io/$(imageName):$(imageTag)"
+                    # Substitute the image on the agent (sed is not available inside command invoke).
+                    OUT="$(Agent.TempDirectory)/demo-app"; mkdir -p "$OUT"
+                    cp "$(appDir)/k8/postgres.yaml" "$(appDir)/k8/service.yaml" "$(appDir)/k8/ingress.yaml" "$OUT/"
+                    sed "s|IMAGE_PLACEHOLDER|$IMAGE|" "$(appDir)/k8/deployment.yaml" > "$OUT/deployment.yaml"
+                    grep -n "image:" "$OUT/deployment.yaml"
+
+                    invoke "kubectl apply -f postgres.yaml -f deployment.yaml -f service.yaml -f ingress.yaml && kubectl rollout status deployment/demo-api -n default --timeout=300s" \
+                      --file "$OUT/postgres.yaml" --file "$OUT/deployment.yaml" \
+                      --file "$OUT/service.yaml" --file "$OUT/ingress.yaml"
+
+                    # Demo data for GET /users (John, Jerry). Idempotent; the table is
+                    # created by `prisma db push` when demo-api starts (rollout above).
+                    invoke "kubectl exec -i postgres -n default -- psql -v ON_ERROR_STOP=1 -U demo -d demo_db < seed-users.sql" \
+                      --file "$(appDir)/k8/seed-users.sql"
+                    invoke "kubectl get pods,svc,endpoints,ingress -n default -o wide"
+
+              # ==========================================
               # Observability Deployment
               # ==========================================
               
                            
               - task: AzureCLI@2
                 displayName: 'Deploy Observability Stack'
+                env:
+                  OBS_UI_PASSWORD: $(OBS_UI_PASSWORD)
                 inputs:
-                  azureSubscription: 'ServiceConnection-Sp'
+                  azureSubscription: '$(serviceConnection)'
                   scriptType: 'bash'
                   scriptLocation: 'inlineScript'
                   inlineScript: |
-                    set -e
+                    set -euo pipefail
+                    az account set --subscription "$(subscriptionId)"
+
+                    # The AKS API is private: kubectl/helm run inside the cluster via
+                    # `az aks command invoke`. It returns 0 even when the remote command
+                    # fails, so read exitCode from the JSON result and fail on non-zero.
+                    invoke() {
+                      local cmd="$1"; shift
+                      az aks command invoke -g "$(resourceGroup)" -n "$(aksCluster)" \
+                        --command "$cmd" "$@" -o json > invoke.json
+                      python3 -c "import json;d=json.load(open('invoke.json'));print(d.get('logs',''));raise SystemExit(d.get('exitCode',1))"
+                    }
 
                     echo "=================================================="
                     echo "Checking AKS connectivity..."
                     echo "=================================================="
-
-                    az aks command invoke \
-                      --resource-group "$(resourceGroup)" \
-                      --name "$(aksCluster)" \
-                      --command "kubectl get nodes"
-
-                    echo ""
+                    invoke "kubectl get nodes -o wide"
                     echo "AKS connectivity validated successfully."
 
                     echo "=============================================="
                     echo "Deploying Observability Stack to Private AKS"
                     echo "=============================================="
+                    invoke "bash deploy-observability.sh" --file "$(appDir)/deploy-observability.sh"
 
-                    az aks command invoke \
-                      --resource-group rg-observability-dev \
-                      --name aks-observability-dev \
-                      --command "bash deploy-observability.sh" \
-                      --file $(System.DefaultWorkingDirectory)/deploy-observability.sh
-                    
                     echo "=============================================="
                     echo "Deploying tempo and OTEL Stack to Private AKS"
                     echo "=============================================="
+                    invoke "bash deploy-tempo-otel.sh" --file "$(appDir)/deploy-tempo-otel.sh"
 
-                    az aks command invoke \
-                      --resource-group rg-observability-dev \
-                      --name aks-observability-dev \
-                      --command "bash deploy-tempo-otel.sh" \
-                      --file $(System.DefaultWorkingDirectory)/deploy-tempo-otel.sh
+                    echo "=============================================="
+                    echo "Grafana: Tempo data source + /grafana via Application Gateway"
+                    echo "=============================================="
+                    invoke "kubectl apply -f grafana-datasource-tempo.yaml -f grafana-ingress.yaml && kubectl get ingress -A" \
+                      --file "$(appDir)/k8/grafana-datasource-tempo.yaml" \
+                      --file "$(appDir)/k8/grafana-ingress.yaml"
+
+                    echo "=============================================="
+                    echo "Prometheus + Alertmanager: HTTPS /prometheus, /alertmanager (basic auth)"
+                    echo "=============================================="
+                    files=(--file "$(appDir)/k8/obs-ui-apply.sh"
+                           --file "$(appDir)/k8/obs-auth-proxy.yaml"
+                           --file "$(appDir)/k8/obs-ui-ingress.yaml")
+                    # Secret variable OBS_UI_PASSWORD (optional): when set, the basic-auth
+                    # user obs-admin gets this password. Only the hash is sent to the
+                    # cluster. When unset, the existing secret is kept.
+                    case "${OBS_UI_PASSWORD:-}" in
+                      ''|'$('*) echo "OBS_UI_PASSWORD not set - keeping existing basic-auth secret" ;;
+                      *) printf 'obs-admin:%s\n' "$(printf '%s' "$OBS_UI_PASSWORD" | openssl passwd -6 -stdin)" > htpasswd
+                         files+=(--file htpasswd) ;;
+                    esac
+                    invoke "bash obs-ui-apply.sh" "${files[@]}"
+                    rm -f htpasswd
 
                     echo "=============================================="
                     echo "Observability Stack deployment completed"
